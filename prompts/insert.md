@@ -1,0 +1,1 @@
+Insert lines after or before one existing line in a text file, by a bare anchor like `Hasu` from `Hasu│content`. The anchor line stays; `lines` are added after (`"after"`) or before (`"before"`) it. Lines are added literally, even if they duplicate neighbors.
