@@ -1,2 +1,3 @@
-- `read`: call before `replace` when you need fresh HASH anchors for a file.
-- `read`: call again after an edit when you need anchors you do not have. The post-edit diff after replace/undo already carries fresh anchors for the changed range.
+- `read`: view files with `read`, not `bash` (`sed`/`grep`/`cat`) — only `read` rows carry usable anchors.
+- `read`: call before `replace` when you need fresh anchors.
+- `read`: call again after an edit when you need anchors you lack — post-edit diff `+anchor│`/` anchor│` rows and any served `anchor│content` rows already carry fresh anchors for the changed range.

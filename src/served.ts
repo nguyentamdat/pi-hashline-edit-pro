@@ -1,5 +1,6 @@
-import { loadHashStore, parseHashList, type HashStore } from "./hash-store";
 import { HASH_CLASS } from "./hashline/alphabet";
+import { hashSource } from "./hashline";
+import { contentChecksum } from "./hashline/hasher";
 
 const SERVED_DIFF_ROW_RE = new RegExp(`^[+ ](${HASH_CLASS})│`);
 
@@ -12,76 +13,20 @@ export function servedHashesFromDiff(diff: string): string[] {
   return hashes;
 }
 
-export function getServed(store: HashStore, path: string): Set<string> | undefined {
-  const row = store.stmts.servedGet(path);
-  if (!row) return undefined;
-  const parsed = parseHashList(row.hashes as string, () => store.stmts.servedDelete(path));
-  if (!parsed) return undefined;
-  return new Set(parsed);
-}
-
-export function recordServed(
-  store: HashStore,
-  path: string,
-  hashes: string[],
-  scope?: ReadonlySet<string>,
-): void {
-  const existing = getServed(store, path);
-  if (!existing && hashes.length === 0) return;
-  const set = existing ?? new Set<string>();
-  let changed = false;
-  if (scope) {
-    for (const hash of set) {
-      if (!scope.has(hash)) {
-        set.delete(hash);
-        changed = true;
-      }
-    }
+export function buildServedMap(
+  fileHashes: string[],
+  fileLines: string[],
+  wantedHashes: string[],
+): Array<[string, string]> {
+  const index = new Map<string, number>();
+  for (let i = 0; i < fileHashes.length; i++) {
+    const existing = index.get(fileHashes[i]!);
+    if (existing === undefined) index.set(fileHashes[i]!, i);
   }
-  for (const hash of hashes) {
-    if (!set.has(hash)) {
-      set.add(hash);
-      changed = true;
-    }
+  const entries: Array<[string, string]> = [];
+  for (const hash of wantedHashes) {
+    const idx = index.get(hash);
+    if (idx !== undefined) entries.push([hash, contentChecksum(hashSource(fileLines[idx]!))]);
   }
-  if (!changed) return;
-  store.stmts.servedUpsert(path, JSON.stringify([...set]), Date.now());
-}
-
-export function recordServedDiff(
-  store: HashStore,
-  path: string,
-  diff: string,
-  scope?: ReadonlySet<string>,
-): void {
-  recordServed(store, path, servedHashesFromDiff(diff), scope);
-}
-
-export function clearServed(store: HashStore, path: string): void {
-  store.stmts.servedDelete(path);
-}
-
-export async function recordServedSafe(
-  path: string,
-  hashes: string[],
-  context: string,
-  scope?: ReadonlySet<string>,
-): Promise<void> {
-  if (hashes.length === 0 && !scope) return;
-  try {
-    const store = await loadHashStore();
-    recordServed(store, path, hashes, scope);
-  } catch (error) {
-    console.error(`Failed to record served state (${context}):`, error);
-  }
-}
-
-export async function recordServedDiffSafe(
-  path: string,
-  diff: string,
-  context: string,
-  scope?: ReadonlySet<string>,
-): Promise<void> {
-  if (!diff) return;
-  await recordServedSafe(path, servedHashesFromDiff(diff), context, scope);
+  return entries;
 }

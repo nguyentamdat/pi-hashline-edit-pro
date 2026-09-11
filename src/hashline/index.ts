@@ -11,6 +11,7 @@ export {
 	_lineHashesPure,
 	initHasher,
 	canon,
+	hashSource,
 } from "./hash";
 
 export {
@@ -27,6 +28,8 @@ export {
 	type BDup,
 	type AutoFix,
 	resEdit,
+	stripAnchorRow,
+	resolveAnchorLine,
 	valEdit,
 	stripBarePrefixes,
 	stripDiffPrefixes,
@@ -40,6 +43,10 @@ export {
 export {
 	buildIdx,
 	applyEdit,
+	planEdit,
+	type PlannedEdit,
 	fmtRegion,
+	fmtRow,
 	changedRange,
+	assertNotEmpty,
 } from "./apply";

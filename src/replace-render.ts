@@ -1,7 +1,10 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import { normReq } from "./replace-normalize";
-import type { ReqParams, ReplaceDetails } from "./replace";
-import { isRec } from "./utils";
+import { Markdown, Text } from "@earendil-works/pi-tui";
+import { keyHint, type Theme } from "@earendil-works/pi-coding-agent";
+import type { ReplaceDetails } from "./replace";
+import { withLineNumbers } from "./utils";
+import { isDedupRow } from "./replace-response";
+import { getPreviewInput } from "./payload-contract";
+export { getPreviewInput };
 
 export type FgT = Pick<Theme, "fg">;
 export type CallT = Pick<Theme, "fg" | "bold">;
@@ -10,51 +13,23 @@ export type MdTheme = Pick<
 	"fg" | "bold" | "italic" | "underline" | "strikethrough"
 >;
 
-export type RPreview = { diff: string } | { error: string };
-
+export type RPreview = { diff: string; path?: string } | { error: string; path?: string };
 export type RRState = {
 	argsKey?: string;
 	preview?: RPreview;
 	previewGeneration?: number;
 	previewTimer?: ReturnType<typeof setTimeout>;
+	previewAbort?: AbortController;
+	resolvedPath?: string;
 };
-
-export function getPreviewInput(
-	args: unknown,
-): ReqParams | null {
-	let normalized: unknown;
-	try {
-		normalized = normReq(args);
-	} catch {
-		return null;
-	}
-	if (!isRec(normalized) || typeof normalized.path !== "string") {
-		return null;
-	}
-
-	if (
-		typeof normalized.remove_from !== "string" ||
-		typeof normalized.remove_to !== "string" ||
-		!Array.isArray(normalized.replacement_lines) ||
-		normalized.replacement_lines.some((line) => typeof line !== "string")
-	) {
-		return null;
-	}
-
-	const request: ReqParams = {
-		path: normalized.path,
-		remove_from: normalized.remove_from,
-		remove_to: normalized.remove_to,
-		replacement_lines: normalized.replacement_lines,
-	};
-	return request;
-}
 
 type DiffRowKind = "added" | "removed" | "context";
 
 function diffRowKind(line: string): DiffRowKind {
-	if (line.startsWith("+") && !line.startsWith("+++")) return "added";
-	if (line.startsWith("-") && !line.startsWith("---")) return "removed";
+	const withoutGutter = line.replace(/^\s*\d+\s+│\s*/, "");
+	if (isDedupRow(withoutGutter) || isDedupRow(withoutGutter.replace(/^\s*│\s*/, ""))) return "removed";
+	if (withoutGutter.startsWith("+") && !withoutGutter.startsWith("+++")) return "added";
+	if (withoutGutter.startsWith("-") && !withoutGutter.startsWith("---")) return "removed";
 	return "context";
 }
 
@@ -65,6 +40,9 @@ export function colorLines(lines: string[], theme: FgT): string[] {
 		if (kind === "removed") return theme.fg("error", line);
 		return theme.fg("dim", line);
 	});
+}
+export function toNumberedDiff(diff: string, lineNumbers: (number|undefined)[]): string {
+	return withLineNumbers(diff, lineNumbers);
 }
 
 export function fmtPreview(
@@ -89,17 +67,22 @@ export function fmtResult(diff: string, theme: FgT): string {
 }
 
 export function fmtCall(
-	args: ReqParams | undefined,
-	state: RRState,
-	expanded: boolean,
-	theme: CallT,
+  args: { path?: string; remove_from?: string; remove_to?: string; anchor?: string } | undefined,
+  state: RRState,
+  expanded: boolean,
+  theme: CallT,
+  toolName = "replace",
 ): string {
-	const path = args?.path;
-	const pathDisplay =
-		typeof path === "string" && path.length > 0
-			? theme.fg("accent", path)
-			: theme.fg("toolOutput", "...");
-	let text = `${theme.fg("toolTitle", theme.bold("replace"))} ${pathDisplay}`;
+  const previewPath = state.preview && "path" in state.preview ? state.preview.path : undefined;
+  const path = args?.path ?? state.resolvedPath ?? previewPath;
+  const anchorFallback = typeof args?.remove_from === "string" && typeof args?.remove_to === "string" ? `${args.remove_from}→${args.remove_to}` : typeof args?.anchor === "string" ? args.anchor : undefined;
+  const pathDisplay =
+    typeof path === "string" && path.length > 0
+      ? theme.fg("accent", path)
+      : typeof anchorFallback === "string" && anchorFallback.length > 0
+        ? theme.fg("accent", anchorFallback)
+        : theme.fg("toolOutput", "...");
+	let text = `${theme.fg("toolTitle", theme.bold(toolName))} ${pathDisplay}`;
 
 	if (!state.preview) {
 		return text;
@@ -143,20 +126,47 @@ export function isApplied(
 	);
 }
 
+const RESULT_PREVIEW_LINES = 16;
+
+export function expandHint(): string {
+	try {
+		return keyHint("app.tools.expand", "to expand");
+	} catch {
+		return "ctrl+o to expand";
+	}
+}
+
+function extractSummary(text: string | undefined): string | undefined {
+	if (!text) return undefined;
+	if (text.includes("│")) return undefined;
+	const warningsIdx = text.indexOf("\n\nWarnings:");
+	const summary = warningsIdx >= 0 ? text.slice(0, warningsIdx) : text;
+	return summary.length > 0 ? summary : undefined;
+}
+
 export function buildAppliedText(
 	text: string | undefined,
 	details: ReplaceDetails | undefined,
 	theme: FgT,
+	expanded: boolean,
 ): string | undefined {
 	const sections: string[] = [];
-
+	const summary = extractSummary(text);
+	if (summary) sections.push(summary);
 	if (details?.diff) {
-		sections.push(fmtResult(details.diff, theme));
+		const rawDiff = details.diffLineNumbers ? toNumberedDiff(details.diff, details.diffLineNumbers) : details.diff;
+		const diffLines = details.diff.split("\n");
+		const diffSection = expanded
+			? fmtResult(rawDiff, theme)
+			: fmtPreview(rawDiff, false, theme);
+		const hint =
+			!expanded && diffLines.length > RESULT_PREVIEW_LINES
+				? ` (${expandHint()})`
+				: "";
+		sections.push(`${diffSection}${hint}`);
 	}
-
-	const warnings = extractWarnings(text);
+	const warnings = details?.warnings?.length ? `Warnings:\n${details.warnings.join("\n")}` : extractWarnings(text);
 	if (warnings) sections.push(warnings);
-
 	return sections.length > 0 ? sections.join("\n\n") : undefined;
 }
 
@@ -209,3 +219,141 @@ export function mkMdTheme(theme: MdTheme) {
 			}),
 	};
 }
+
+export const PREVIEW_DEBOUNCE_MS = 150;
+
+export function reuseText(context: any, content: string): Text {
+	const t = context.lastComponent instanceof Text
+		? context.lastComponent
+		: new Text("", 0, 0);
+	t.setText(content);
+	return t;
+}
+
+export function reuseMarkdown(context: any, content: string, theme: any): Markdown {
+	const m = context.lastComponent instanceof Markdown
+		? context.lastComponent
+		: new Markdown("", 0, 0, mkMdTheme(theme));
+	m.setText(content);
+	return m;
+}
+
+export function makeRenderCall(
+	preview: (args: unknown, cwd: string, signal?: AbortSignal) => Promise<RPreview>,
+  options: {
+    getInput?: (args: unknown) => { path?: string; remove_from?: string; remove_to?: string; anchor?: string } | null;
+    toolName?: string;
+    resolveTarget?: (input: { remove_from?: string; remove_to?: string; anchor?: string }) => string | undefined;
+  } = {},
+) {
+	const getInput = options.getInput ?? getPreviewInput;
+	const toolName = options.toolName ?? "replace";
+	return (args: any, theme: CallT, context: any): Text => {
+		const previewInput = getInput(args);
+		if (!context.executionStarted && previewInput) {
+			const resolved = options.resolveTarget?.(previewInput);
+			context.state.resolvedPath = resolved;
+		}
+		const cancelPendingPreview = () => {
+			if (context.state.previewTimer) {
+				clearTimeout(context.state.previewTimer);
+				context.state.previewTimer = undefined;
+			}
+			if (context.state.previewAbort) {
+				context.state.previewAbort.abort();
+				context.state.previewAbort = undefined;
+			}
+		};
+		if (context.executionStarted) {
+			cancelPendingPreview();
+			context.state.argsKey = undefined;
+			context.state.preview = undefined;
+			context.state.previewGeneration = (context.state.previewGeneration ?? 0) + 1;
+		} else if (!context.argsComplete || !previewInput) {
+			cancelPendingPreview();
+			context.state.argsKey = undefined;
+			context.state.preview = undefined;
+			context.state.previewGeneration = (context.state.previewGeneration ?? 0) + 1;
+		} else {
+			const argsKey = JSON.stringify(previewInput);
+			if (context.state.argsKey !== argsKey) {
+				cancelPendingPreview();
+				context.state.argsKey = argsKey;
+				context.state.preview = undefined;
+				const previewGeneration = (context.state.previewGeneration ?? 0) + 1;
+				context.state.previewGeneration = previewGeneration;
+				context.state.previewTimer = setTimeout(() => {
+					context.state.previewTimer = undefined;
+					const controller = new AbortController();
+					context.state.previewAbort = controller;
+					preview(args, context.cwd, controller.signal)
+						.then((result) => {
+							if (controller.signal.aborted) return;
+							if (context.state.previewAbort === controller) context.state.previewAbort = undefined;
+							if (
+								context.state.argsKey === argsKey &&
+								context.state.previewGeneration === previewGeneration
+							) {
+								context.state.preview = result;
+								context.invalidate();
+							}
+						})
+						.catch((err: unknown) => {
+							if (controller.signal.aborted) return;
+							if (context.state.previewAbort === controller) context.state.previewAbort = undefined;
+							if (
+								context.state.argsKey === argsKey &&
+								context.state.previewGeneration === previewGeneration
+							) {
+								context.state.preview = {
+									error: err instanceof Error ? err.message : String(err),
+								};
+								context.invalidate();
+							}
+						});
+				}, PREVIEW_DEBOUNCE_MS);
+			}
+		}
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		text.setText(fmtCall(getInput(args) ?? undefined, context.state as RRState, context.expanded, theme, toolName));
+		return text;
+	};
+}
+
+export function renderEditResult(
+	result: { content?: Array<{ type: string; text?: string }>; details?: ReplaceDetails },
+	options: { isPartial: boolean; expanded?: boolean } | boolean,
+	theme: FgT,
+	context: any,
+): Text | Markdown {
+	const isPartial = typeof options === "boolean" ? options : options.isPartial;
+	const optionsExpanded = typeof options === "boolean" ? undefined : options.expanded;
+	if (isPartial) return reuseText(context, theme.fg("warning", "Editing..."));
+	const renderedText = getResultText(result);
+	const renderState = context.state as RRState | undefined;
+	if (renderState) {
+		if (renderState.previewTimer) {
+			clearTimeout(renderState.previewTimer);
+			renderState.previewTimer = undefined;
+		}
+		if (renderState.previewAbort) {
+			renderState.previewAbort.abort();
+			renderState.previewAbort = undefined;
+		}
+		renderState.preview = undefined;
+		renderState.previewGeneration = (renderState.previewGeneration ?? 0) + 1;
+	}
+	if (context.isError) {
+		return renderedText
+			? reuseText(context, `\n${theme.fg("error", renderedText)}`)
+			: new Text("", 0, 0);
+	}
+	if (isApplied(result.details)) {
+		const isExpanded = optionsExpanded === true || context.expanded === true;
+		const appliedText = buildAppliedText(renderedText, result.details, theme, isExpanded);
+		return appliedText ? reuseText(context, appliedText) : new Text("", 0, 0);
+	}
+	if (!renderedText) return new Text("", 0, 0);
+	return reuseMarkdown(context, fmtResultMd(renderedText), theme);
+}
+

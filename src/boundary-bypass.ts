@@ -1,6 +1,6 @@
 import { parseText } from "./hashline/parse";
 import { ANCHOR_ROW_RE } from "./hashline/resolve";
-import { HL_BARE_PREFIX_RE, HL_PREFIX_PLUS_RE, HL_PREFIX_MINUS_RE } from "./hashline/hash";
+import { stripRowPrefix } from "./hashline/hash";
 
 function canonRef(ref: string): string {
   const trimmed = ref.trim();
@@ -9,18 +9,11 @@ function canonRef(ref: string): string {
 }
 
 function canonLines(lines: string[]): string[] {
-  return parseText(lines).map((line) => {
-    const bare = line.match(HL_BARE_PREFIX_RE);
-    if (bare) return line.slice(bare[0].length);
-    const plus = line.match(HL_PREFIX_PLUS_RE);
-    if (plus) return line.slice(plus[0].length);
-    const minus = line.match(HL_PREFIX_MINUS_RE);
-    if (minus) return line.slice(minus[0].length);
-    return line;
-  });
+  return parseText(lines).map((line) => stripRowPrefix(line).text);
 }
 
 const boundaryBypassTracker = new Map<string, string>();
+const BOUNDARY_BYPASS_LIMIT = 256;
 
 export function noopPayloadKey(
   absolutePath: string,
@@ -37,7 +30,12 @@ export function noopPayloadKey(
 }
 
 export function markBoundaryNoop(absolutePath: string, payload: string): void {
+  boundaryBypassTracker.delete(absolutePath);
   boundaryBypassTracker.set(absolutePath, payload);
+  if (boundaryBypassTracker.size > BOUNDARY_BYPASS_LIMIT) {
+    const oldest = boundaryBypassTracker.keys().next().value;
+    if (oldest !== undefined) boundaryBypassTracker.delete(oldest);
+  }
 }
 
 export function consumeBoundaryBypass(absolutePath: string, payload: string): boolean {

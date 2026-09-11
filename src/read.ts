@@ -3,28 +3,28 @@ import {
 	createReadTool,
 	formatSize,
 	truncateHead,
+	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { MAX_READ_LINE_BYTES } from "./constants";
 import { loadFileKindAndText } from "./file-kind";
+import { MAX_OVERSIZED_WARNING_LINES } from "./constants";
 import { readNormFile, safeSnapId } from "./file-reader";
-import { lineHashes, fmtRegion, HASH_SEP, MAX_HASH_LINES } from "./hashline";
+import { lineHashes, fmtRegion, fmtRow, HASH_SEP, MAX_HASH_LINES } from "./hashline";
 import { toCwd } from "./paths";
-import { abortIf, makePrepareArguments, visLines } from "./utils";
-import { recordServedSafe } from "./served";
+import { abortIf, makePrepareArguments, numberedRead, visLines, splitLines } from "./utils";
 import { loadP, loadGuide } from "./prompts";
+import { withReadPrompts, DEFAULT_EDIT_FLAGS, type EditToolFlags } from "./edit-common";
 import { valAccess } from "./validation";
-
+import { markServed as markServedScoped } from "./anchor-registry";
+import { buildServedMap } from "./served";
+import { Text } from "@earendil-works/pi-tui";
 const R_DESC = loadP("../prompts/read.md");
-
 const R_SNIPPET = loadP("../prompts/read-snippet.md");
-
 function readGuide(): string[] {
-	return loadGuide("../prompts/read-guidelines.md");
+  return loadGuide("../prompts/read-guidelines.md");
 }
-
 function normPosInt(
 	value: number | undefined,
 	name: "offset" | "limit",
@@ -56,7 +56,7 @@ export async function fmtReadPreview(
 	options: { offset?: number; limit?: number },
 	precomputedHashes?: string[],
 	path?: string,
-	maxLineBytes = MAX_READ_LINE_BYTES,
+	maxLineBytes = DEFAULT_MAX_BYTES,
 	maxTruncLines = DEFAULT_MAX_LINES,
 ): Promise<{ text: string; truncation?: TruncationResult; nextOffset?: number; servedHashes: string[] }> {
 	const allLines = visLines(text);
@@ -100,21 +100,27 @@ export async function fmtReadPreview(
 		const oversized = rowSizes.filter((row) => row.bytes > maxBytes);
 		const rows = rowSizes.map((row, index) =>
 			row.bytes > maxBytes
-				? `[Line ${row.lineNumber} is ${formatSize(row.bytes)}, exceeds ${formatSize(maxBytes)}; content not shown. Use bash: sed -n '${row.lineNumber}p' <path> | head -c ${maxBytes}]`
+				? fmtRow(selectedHashes[index]!, `[Line ${row.lineNumber} is ${formatSize(row.bytes)}, exceeds ${formatSize(maxBytes)}; content not shown. Use bash: sed -n '${row.lineNumber}p' <path> | head -c ${maxBytes}]`)
 				: fmtRegion([selectedHashes[index]!], [selected[index]!]),
 		);
 		const skippedTruncation = truncateHead(rows.join("\n"), { maxBytes, maxLines: maxTruncLines });
 		const shownRowCount = skippedTruncation.content === "" ? 0 : skippedTruncation.content.split("\n").length;
 		const lastShownLine = shownRowCount > 0 ? startLine + shownRowCount - 1 : startLine - 1;
-		const oversizedIndexes = new Set(rowSizes.map((row, index) => row.bytes > maxBytes ? index : -1).filter((index) => index >= 0));
 		const servedHashes: string[] = [];
 		for (let index = 0; index < Math.min(shownRowCount, rows.length); index++) {
-			if (!oversizedIndexes.has(index)) servedHashes.push(selectedHashes[index]!);
+			servedHashes.push(selectedHashes[index]!);
 		}
-		const lineLabel = oversized.length === 1 ? `Line ${oversized[0]!.lineNumber}` : `Lines ${oversized.map((row) => row.lineNumber).join(", ")}`;
-		const verb = oversized.length === 1 ? "exceeds" : "exceed";
-		const addresses = oversized.map((row) => `${row.lineNumber}p`).join(";");
-		const warning = `[${lineLabel} ${verb} ${formatSize(maxBytes)}; content not shown. Inspect with bash: sed -n '${addresses}' <path> | head -c ${maxBytes}]`;
+		const listed = oversized.slice(0, MAX_OVERSIZED_WARNING_LINES);
+		const hiddenCount = oversized.length - listed.length;
+		const lineLabel = oversized.length === 1
+			? `Line ${oversized[0]!.lineNumber}`
+			: `Lines ${listed.map((row) => row.lineNumber).join(', ')}${hiddenCount > 0 ? `, ... (+${hiddenCount} more)` : ''}`;
+		const verb = oversized.length === 1 ? 'exceeds' : 'exceed';
+		const addresses = listed.map((row) => `${row.lineNumber}p`).join(';');
+		const moreHint = hiddenCount > 0
+			? ` ${hiddenCount} more oversized line(s). Use read with offset to inspect them.`
+			: '';
+		const warning = `[${lineLabel} ${verb} ${formatSize(maxBytes)}; content not shown. Inspect with bash: sed -n '${addresses}' <path> | head -c ${maxBytes}${moreHint}]`;
 		let preview = skippedTruncation.content;
 		let nextOffset: number | undefined;
 		if (shownRowCount > 0 && (skippedTruncation.truncated || lastShownLine < totalLines)) {
@@ -158,13 +164,14 @@ export async function fmtReadPreview(
 	};
 }
 
-export function regRead(pi: ExtensionAPI): void {
-	pi.registerTool({
-		name: "read",
-		label: "Read",
-		description: R_DESC,
-		promptSnippet: R_SNIPPET,
-		promptGuidelines: readGuide(),
+export function regRead(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FLAGS): void {
+  const prompted = withReadPrompts({ description: R_DESC, snippet: R_SNIPPET, guidelines: readGuide() }, flags);
+  pi.registerTool({
+    name: "read",
+    label: "Read",
+    description: prompted.description,
+    promptSnippet: prompted.snippet,
+    promptGuidelines: prompted.guidelines,
 		prepareArguments: makePrepareArguments(),
 		parameters: Type.Object({
 			path: Type.String({
@@ -183,6 +190,18 @@ export function regRead(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
+		executionMode: "sequential",
+		renderResult(result, { isPartial, expanded }, theme, context) {
+			if (isPartial) return new Text((theme as unknown as { fg: (a:string,b:string)=>string }).fg("warning", "Reading..."), 0, 0);
+			const raw = (result.content?.[0] as { text?: string } | undefined)?.text;
+			if (typeof raw !== "string") return new Text("", 0, 0);
+			if ((context as unknown as { isError?: boolean }).isError) return new Text((theme as unknown as { fg: (a:string,b:string)=>string }).fg("error", raw), 0, 0);
+			const isExpanded = expanded === true || (context as unknown as { expanded?: boolean }).expanded === true;
+			if (!isExpanded) return new Text("", 0, 0);
+			const details = (result as unknown as { details?: { offset?: number } }).details;
+			const off = details?.offset ?? (context as unknown as { args?: { offset?: number } }).args?.offset ?? 1;
+			return new Text(numberedRead(raw, off), 0, 0);
+		},
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const rawPath = params.path;
@@ -207,6 +226,7 @@ export function regRead(pi: ExtensionAPI): void {
       const { normalized, fileHashes, hadUtf8DecodeErrors, absolutePath: resolvedPath } = await readNormFile(
         rawPath, ctx.cwd, { signal, preloadedFile: file, maxLines: MAX_HASH_LINES },
       );
+			const fileLines = splitLines(normalized);
 			const preview = await fmtReadPreview(
 				normalized,
 				{
@@ -216,7 +236,7 @@ export function regRead(pi: ExtensionAPI): void {
 				fileHashes,
 				resolvedPath,
 			);
-			await recordServedSafe(resolvedPath, preview.servedHashes, "read", new Set(fileHashes));
+			markServedScoped(resolvedPath, buildServedMap(fileHashes, fileLines, preview.servedHashes), new Set(fileHashes));
 			const snapshotId = await safeSnapId(absolutePath, "read");
 			const previewText =
 				hadUtf8DecodeErrors
@@ -228,6 +248,7 @@ export function regRead(pi: ExtensionAPI): void {
 				details: {
 					truncation: preview.truncation,
 					snapshotId,
+					offset: params.offset ?? 1,
 					...(preview.nextOffset !== undefined
 						? { nextOffset: preview.nextOffset }
 						: {}),
