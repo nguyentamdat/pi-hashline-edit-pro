@@ -1,6 +1,6 @@
-import { readFile } from "fs/promises";
-import { constants } from "fs";
-import { relative } from "path";
+import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { relative } from "node:path";
 import { readConfig, getDiffContextLines } from "./config";
 import { resolveEditTarget, throwIfStrictInput, tryResolveEditTarget } from "./edit-common";
 import { readNormFile, safeSnapId } from "./file-reader";
@@ -656,6 +656,7 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
       },
       boundaryDedupAbove: [],
       boundaryDedupBelow: [],
+      spans,
     },
     batchVerb(runtime),
     await getDiffContextLines(),

@@ -1,4 +1,4 @@
-import { readFile } from "fs/promises";
+import { readFile } from "node:fs/promises";
 import type { PipelineResult } from "./replace";
 import { abortIf, errCode, splitLines } from "./utils";
 import { DEDUP_ANCHOR } from "./constants";
@@ -149,6 +149,7 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     editMeta,
     boundaryDedupAbove: pipe.boundaryDedupAbove,
     boundaryDedupBelow: pipe.boundaryDedupBelow,
+    ...(span ? { spans: [{ start: span[0], end: span[1], replacementCount }] } : {}),
   };
   const changed = buildChanged(successInput, meta.verb, await getDiffContextLines());
   if (changed.details.diff) {
