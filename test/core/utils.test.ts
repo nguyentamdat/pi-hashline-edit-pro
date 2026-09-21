@@ -10,6 +10,7 @@ import {
   makePrepareArguments,
   truncateToBytes,
   decodeStringArray,
+  assertByteLimit,
 } from "../../src/utils";
 
 describe("isRec", () => {
@@ -311,6 +312,18 @@ describe("makePrepareArguments", () => {
     const result = prepare({ path: "a.txt", file_path: "b.txt" });
     expect(result).toEqual({ path: "a.txt", file_path: "b.txt" });
   });
+
+  it("normalizes from and to to remove_from and remove_to", () => {
+    const prepare = makePrepareArguments();
+    const result = prepare({ from: "a", to: "b" });
+    expect(result).toEqual({ remove_from: "a", remove_to: "b" });
+  });
+
+  it("normalizes from and to only when the remove field is missing", () => {
+    const prepare = makePrepareArguments();
+    const result = prepare({ remove_from: "a", from: "b", to: "c" });
+    expect(result).toEqual({ remove_from: "a", from: "b", remove_to: "c" });
+  });
 });
 
 describe("truncateToBytes", () => {
@@ -361,13 +374,82 @@ describe("decodeStringArray", () => {
     expect(decodeStringArray("[1, 2]")).toBeUndefined();
     expect(decodeStringArray('["ok", 7]')).toBeUndefined();
     expect(decodeStringArray("[bare]")).toBeUndefined();
-    expect(decodeStringArray('["trailing",]')).toBeUndefined();
     expect(decodeStringArray('["open"')).toBeUndefined();
     expect(decodeStringArray("   ")).toBeUndefined();
     expect(decodeStringArray(42)).toBeUndefined();
     expect(decodeStringArray(null)).toBeUndefined();
     expect(decodeStringArray(["alpha", "beta"])).toBeUndefined();
     expect(decodeStringArray([])).toBeUndefined();
+  });
+});
+
+describe("decodeStringArray leniency", () => {
+  it("decodes trailing commas", () => {
+    expect(decodeStringArray('["alpha", "beta",]')).toEqual(["alpha", "beta"]);
+    expect(decodeStringArray(['["alpha", "beta",]'])).toEqual(["alpha", "beta"]);
+    expect(decodeStringArray('["solo", ]')).toEqual(["solo"]);
+  });
+
+  it("decodes single-quoted strings", () => {
+    expect(decodeStringArray("['alpha', 'beta']")).toEqual(["alpha", "beta"]);
+    expect(decodeStringArray("['it\\'s', \"fine\"]")).toEqual(["it's", "fine"]);
+  });
+
+  it("decodes escaped quotes", () => {
+    expect(decodeStringArray('["say \\"hi\\"", "b"]')).toEqual(['say "hi"', "b"]);
+  });
+
+  it("decodes fenced JSON blocks", () => {
+    expect(decodeStringArray('```json\n["alpha", "beta"]\n```')).toEqual(["alpha", "beta"]);
+    expect(decodeStringArray('```\n["alpha"]\n```')).toEqual(["alpha"]);
+  });
+
+  it("unwraps array syntax", () => {
+    const warnings: string[] = [];
+    expect(decodeStringArray(['["alpha"]'], warnings)).toEqual(["alpha"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("uses the provided label in warnings", () => {
+    const warnings: string[] = [];
+    decodeStringArray('["alpha", 7]', warnings, "lines");
+    expect(warnings[0]).toContain("lines looked like a JSON array");
+  });
+
+  it("warns instead of silently keeping unparseable string-array text", () => {
+    const warnings: string[] = [];
+    expect(decodeStringArray('["alpha", 7]', warnings)).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("looked like a JSON array but could not be parsed");
+    expect(warnings[0]).toContain("literal line");
+  });
+
+  it("does not warn for plain text or non-string arrays", () => {
+    const warnings: string[] = [];
+    expect(decodeStringArray("hello", warnings)).toBeUndefined();
+    expect(decodeStringArray("[1, 2]", warnings)).toBeUndefined();
+    expect(decodeStringArray("[bare]", warnings)).toBeUndefined();
+    expect(warnings).toHaveLength(0);
+  });
+
+  it("decodes standard JSON escapes", () => {
+    expect(decodeStringArray('["a\\\\b", "a\\/b", "a\\bb", "a\\fb", "a\\rb", "a\\tb"]')).toEqual([
+      "a\\b",
+      "a/b",
+      "a\bb",
+      "a\fb",
+      "a\rb",
+      "a\tb",
+    ]);
+  });
+
+  it("rejects malformed escape and comma shapes", () => {
+    expect(decodeStringArray('["\\u12"]')).toBeUndefined();
+    expect(decodeStringArray('["\\uZZZZ"]')).toBeUndefined();
+    expect(decodeStringArray('["a\\]')).toBeUndefined();
+    expect(decodeStringArray("[  ]")).toBeUndefined();
+    expect(decodeStringArray("[,]")).toBeUndefined();
+    expect(decodeStringArray('["a", ,]')).toBeUndefined();
   });
 });
 
@@ -385,5 +467,22 @@ describe("decodeStringArray control bytes", () => {
     expect(decodeStringArray('["a' + cr + 'b"]')).toEqual(["a" + cr + "b"]);
     expect(decodeStringArray('["a' + nul + 'b"]')).toEqual(["a" + nul + "b"]);
     expect(decodeStringArray('["a' + backslash + 'qb"]')).toBeUndefined();
+  });
+});
+
+describe("assertByteLimit", () => {
+  it("allows content at the limit and rejects content over it", () => {
+    expect(() => assertByteLimit("abc", "f.txt", 3)).not.toThrow();
+    expect(() => assertByteLimit("abcd", "f.txt", 3)).toThrow(/^\[E_FILE_TOO_LARGE\] File is too large: f\.txt/);
+  });
+
+  it("measures UTF-8 bytes rather than characters", () => {
+    expect(() => assertByteLimit("é", "f.txt", 2)).not.toThrow();
+    expect(() => assertByteLimit("é", "f.txt", 1)).toThrow(/E_FILE_TOO_LARGE/);
+  });
+
+  it("reports the exceeded limit in megabytes", () => {
+    const oneMb = 1024 * 1024;
+    expect(() => assertByteLimit("a".repeat(oneMb + 1), "f.txt", oneMb)).toThrow(/exceeds the 1MB size limit/);
   });
 });

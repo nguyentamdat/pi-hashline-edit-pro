@@ -5,7 +5,7 @@ import { withTempFile, makeFakePiRegistry, setupIntegrationTest, getText, extrac
 import { resolveTarget } from "../../src/fs-write";
 import { toCwd } from "../../src/paths";
 import register from "../../index";
-import { insertPreview, buildInsertToolDef } from "../../src/insert";
+import { insertPreview, buildInsertToolDef, assertInsertReq } from "../../src/insert";
 import type { RRState } from "../../src/replace-render";
 
 describe("insert tool", () => {
@@ -212,6 +212,30 @@ describe("insert tool", () => {
     });
   });
 
+  it("rejects a NUL byte in lines before any file I/O", () => {
+    const nul = String.fromCharCode(0);
+    expect(() => assertInsertReq({ anchor: "Hasu", direction: "after", lines: [nul] })).toThrow(/NUL byte/);
+  });
+
+  it("rejects a NUL byte in inserted lines", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const insertTool = getTool("insert");
+      const readResult = await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx);
+      const betaHash = extractHash(getText(readResult).split("\n").find((l) => l.includes("│beta"))!);
+      const nul = String.fromCharCode(0);
+
+      await expect(
+        insertTool.execute(
+          "i1",
+          { anchor: betaHash, direction: "after", lines: [`a${nul}b`] },
+          undefined, undefined, ctx,
+        ),
+      ).rejects.toThrow(/NUL byte/);
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\n");
+    });
+  });
+
   it("names path when passed in anchor-only mode", async () => {
     await withTempFile("sample.ts", "alpha\n", async ({ cwd }) => {
       const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
@@ -292,7 +316,7 @@ describe("insert tool", () => {
     });
   });
 
-  it("an applied insert clears a pending boundary bypass", async () => {
+  it("keeps a dedup-cut noop a noop after an unrelated insert", async () => {
     await withTempFile("sample.ts", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
       const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
       const insertTool = getTool("insert");
@@ -317,12 +341,11 @@ describe("insert tool", () => {
 
       const resend = await editTool.execute("e2", payload, undefined, undefined, ctx);
       expect(resend.details.classification).toBe("noop");
-      expect(getText(resend)).not.toContain("[W_BOUNDARY_BYPASS]");
       expect(await readFile(path, "utf-8")).toBe("aaa\nAAA2\nbbb\nccc\n");
     });
   });
 
-  it("expands a stringified lines array with a warning", async () => {
+  it("expands a stringified lines array", async () => {
     await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
       const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
       const insertTool = getTool("insert");
@@ -335,7 +358,23 @@ describe("insert tool", () => {
         undefined, undefined, ctx,
       );
       expect(result.content[0].text).toContain("Successfully inserted in sample.ts");
-      expect(result.content[0].text).toContain("Unwrapped JSON array syntax");
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\nbeta1\nbeta2\ngamma\n");
+    });
+  });
+
+  it("applies stringified lines with trailing commas", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const insertTool = getTool("insert");
+      const readResult = await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx);
+      const betaHash = extractHash(getText(readResult).split("\n").find((l) => l.includes("beta"))!);
+
+      const result = await insertTool.execute(
+        "i1",
+        { anchor: betaHash, direction: "after", lines: ['["beta1", "beta2",]'] },
+        undefined, undefined, ctx,
+      );
+      expect(result.content[0].text).toContain("Successfully inserted in sample.ts");
       expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\nbeta1\nbeta2\ngamma\n");
     });
   });

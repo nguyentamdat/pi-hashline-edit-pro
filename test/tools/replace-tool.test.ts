@@ -1,6 +1,6 @@
 import { join } from "path";
 import { describe, expect, it } from "vitest";
-import { readFile } from "fs/promises";
+import { mkdir, readFile, writeFile } from "fs/promises";
 import { lineHashes } from "../../src/hashline";
 import { compPreview, editToolSchema, regReplace } from "../../src/replace";
 import { makeFakePiRegistry, withTempFile, useTestHome } from "../support/fixtures";
@@ -80,6 +80,29 @@ describe("regReplace", () => {
         "e1",
         {
           replace_from: hashes[1]!, replace_to: hashes[1]!,
+          replacement_lines: ["BeSR"],
+        },
+        undefined,
+        undefined,
+        { cwd } as any,
+      );
+
+      expect(result.content[0].text).toContain("Successfully replaced in sample.txt");
+      expect(result.content[0].text).toContain("Added 1 line(s), removed 1 line(s).");
+    });
+  });
+
+  it("replaces a single line via the from/to aliases", async () => {
+    await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd }) => {
+      const { pi, getTool } = makeFakePiRegistry();
+      regReplace(pi);
+      const tool = getTool("replace");
+      const hashes = await lineHashes("aaa\nbbb\nccc\n", join(cwd, "sample.txt"));
+
+      const result = await tool.execute(
+        "e1",
+        {
+          from: hashes[1]!, to: hashes[1]!,
           replacement_lines: ["BeSR"],
         },
         undefined,
@@ -273,7 +296,7 @@ describe("regReplace", () => {
     });
   });
 
-  it("expands a stringified replacement_lines array with a warning", async () => {
+  it("expands a stringified replacement_lines array", async () => {
     await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
       const { pi, getTool } = makeFakePiRegistry();
       regReplace(pi);
@@ -292,8 +315,126 @@ describe("regReplace", () => {
       );
 
       expect(result.content[0].text).toContain("Successfully replaced in sample.txt");
-      expect(result.content[0].text).toContain("Unwrapped JSON array syntax");
       expect(await readFile(path, "utf-8")).toBe("aaa\nB1\nB2\nccc\n");
+    });
+  });
+
+  it("applies stringified arrays with trailing commas and single quotes", async () => {
+    await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
+      const { pi, getTool } = makeFakePiRegistry();
+      regReplace(pi);
+      const tool = getTool("replace");
+      const hashes = await lineHashes("aaa\nbbb\nccc\n", path);
+
+      const result = await tool.execute(
+        "e1",
+        {
+          remove_from: hashes[1]!, remove_to: hashes[1]!,
+          replacement_lines: ["['B1', 'B2',]"],
+        },
+        undefined,
+        undefined,
+        { cwd } as any,
+      );
+
+      expect(result.content[0].text).toContain("Successfully replaced in sample.txt");
+      expect(await readFile(path, "utf-8")).toBe("aaa\nB1\nB2\nccc\n");
+    });
+  });
+
+  it("rejects a NUL byte in replacement_lines and leaves the file unchanged", async () => {
+    await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
+      const { pi, getTool } = makeFakePiRegistry();
+      regReplace(pi);
+      const tool = getTool("replace");
+      const hashes = await lineHashes("aaa\nbbb\nccc\n", path);
+      const nul = String.fromCharCode(0);
+
+      await expect(tool.execute(
+        "e1",
+        {
+          remove_from: hashes[1]!, remove_to: hashes[1]!,
+          replacement_lines: [`a${nul}b`],
+        },
+        undefined,
+        undefined,
+        { cwd } as any,
+      )).rejects.toThrow(/NUL byte/);
+
+      expect(await readFile(path, "utf-8")).toBe("aaa\nbbb\nccc\n");
+    });
+  });
+
+  it("rejects a NUL byte decoded from stringified array text", async () => {
+    await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
+      const { pi, getTool } = makeFakePiRegistry();
+      regReplace(pi);
+      const tool = getTool("replace");
+      const hashes = await lineHashes("aaa\nbbb\nccc\n", path);
+      const backslash = String.fromCharCode(92);
+
+      await expect(tool.execute(
+        "e1",
+        {
+          remove_from: hashes[1]!, remove_to: hashes[1]!,
+          replacement_lines: [`["${backslash}u0000"]`],
+        },
+        undefined,
+        undefined,
+        { cwd } as any,
+      )).rejects.toThrow(/NUL byte/);
+
+      expect(await readFile(path, "utf-8")).toBe("aaa\nbbb\nccc\n");
+    });
+  });
+
+  it("warns instead of writing unparseable string-array text literally", async () => {
+    await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
+      const { pi, getTool } = makeFakePiRegistry();
+      regReplace(pi);
+      const tool = getTool("replace");
+      const hashes = await lineHashes("aaa\nbbb\nccc\n", path);
+
+      const result = await tool.execute(
+        "e1",
+        {
+          remove_from: hashes[1]!, remove_to: hashes[1]!,
+          replacement_lines: ['["B1", 7]'],
+        },
+        undefined,
+        undefined,
+        { cwd } as any,
+      );
+
+      expect(result.content[0].text).toContain("looked like a JSON array but could not be parsed");
+      expect(await readFile(path, "utf-8")).toBe('aaa\n["B1", 7]\nccc\n');
+    });
+  });
+
+  it("rejects unparseable string-array text in strict-input mode", async () => {
+    await withTempFile("sample.txt", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
+      await mkdir(join(cwd, ".config", "pi-hashline-edit-pro"), { recursive: true });
+      await writeFile(
+        join(cwd, ".config", "pi-hashline-edit-pro", "config.json"),
+        JSON.stringify({ autoRead: true, strictInput: true }),
+        "utf-8",
+      );
+      const { pi, getTool } = makeFakePiRegistry();
+      regReplace(pi);
+      const tool = getTool("replace");
+      const hashes = await lineHashes("aaa\nbbb\nccc\n", path);
+
+      await expect(tool.execute(
+        "e1",
+        {
+          remove_from: hashes[1]!, remove_to: hashes[1]!,
+          replacement_lines: ['["B1", 7]'],
+        },
+        undefined,
+        undefined,
+        { cwd } as any,
+      )).rejects.toThrow("[E_BAD_SHAPE] Strict-input mode rejects auto-fixable input");
+      expect(await readFile(path, "utf-8")).toBe("aaa\nbbb\nccc\n");
     });
   });
 

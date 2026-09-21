@@ -62,6 +62,39 @@ describe("resEdit", () => {
     expect(resolved.content_lines).toEqual(["a", "b", "c"]);
   });
 
+  it("unwraps a stringified replacement_lines array", () => {
+    const warnings: string[] = [];
+    const edit = {
+      remove_from: "wpDM", remove_to: "wpDM",
+      replacement_lines: ['["a", "b",]'],
+    } as unknown as HTEdit;
+    const resolved = resEdit(edit, warnings);
+    expect(resolved.content_lines).toEqual(["a", "b"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("decodes single-quoted array text", () => {
+    const warnings: string[] = [];
+    const edit = {
+      remove_from: "wpDM", remove_to: "wpDM",
+      replacement_lines: ["['a', 'b']"],
+    } as unknown as HTEdit;
+    const resolved = resEdit(edit, warnings);
+    expect(resolved.content_lines).toEqual(["a", "b"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns but keeps unparseable string-array text as one literal line", () => {
+    const warnings: string[] = [];
+    const edit = {
+      remove_from: "wpDM", remove_to: "wpDM",
+      replacement_lines: ['["a", 7]'],
+    } as unknown as HTEdit;
+    const resolved = resEdit(edit, warnings);
+    expect(resolved.content_lines).toEqual(['["a", 7]']);
+    expect(warnings[0]).toContain("looked like a JSON array but could not be parsed");
+  });
+
 	it("rejects null replacement_lines input", () => {
 		const edit = {
 			remove_from: "wpDM", remove_to: "wpDM",
