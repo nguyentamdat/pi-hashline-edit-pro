@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdir, readFile, readdir, rm, writeFile } from "fs/promises";
+import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import { createHash } from "crypto";
 import { join } from "path";
 import {
@@ -59,7 +59,7 @@ describe("anchor registry", () => {
     const second = allocateAnchor("b.ts", "ck1");
     const third = allocateAnchor("c.ts", "ck2");
     expect(new Set([first, second, third]).size).toBe(3);
-    expect(first).toMatch(/^[A-Za-z0-9]{4}$/);
+    expect(first).toMatch(/^[A-Za-z]{4}$/);
   });
 
   it("does not repeat the mint sequence after an ephemeral re-init", async () => {
@@ -109,7 +109,7 @@ describe("anchor registry", () => {
     resetRegistryForTests();
     expect(() => allocateAnchor("a.ts", "ck")).toThrow(/E_REGISTRY/);
     await initRegistry(undefined);
-    expect(allocateAnchor("a.ts", "ck")).toMatch(/^[A-Za-z0-9]{4}$/);
+    expect(allocateAnchor("a.ts", "ck")).toMatch(/^[A-Za-z]{4}$/);
   });
 
   it("never mints an owned anchor", () => {
@@ -288,8 +288,8 @@ describe("anchor registry", () => {
     const anchor = allocateAnchor("restored.ts", "ckR");
     markServed("restored.ts", [[anchor, "ckR"]]);
 
-    const sidecars = await readdir(sessionClaimsDir());
-    const sidecarPath = join(sessionClaimsDir(), sidecars.find((n) => n.endsWith(".registry.jsonl"))!);
+    const sidecarKey = createHash("sha256").update(sessionFile).digest("hex").slice(0, 24);
+    const sidecarPath = join(sessionClaimsDir(), `${sidecarKey}.registry.jsonl`);
     const log = await readFile(sidecarPath, "utf-8");
     expect(parseRegistryLog(log).some((e) => e.kind === "allocate")).toBe(true);
 

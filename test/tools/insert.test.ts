@@ -102,7 +102,7 @@ describe("insert tool", () => {
       const insertTool = getTool("insert");
       const readResult = await readTool.execute("r1", { path: "empty.ts" }, undefined, undefined, ctx);
       const emptyHash = getText(readResult).split("\n")[0]!.split("│")[0]!;
-      expect(emptyHash).toMatch(/^[A-Za-z0-9]{4}$/);
+      expect(emptyHash).toMatch(/^[A-Za-z]{4}$/);
 
       await insertTool.execute(
         "i1",
@@ -316,35 +316,6 @@ describe("insert tool", () => {
     });
   });
 
-  it("keeps a dedup-cut noop a noop after an unrelated insert", async () => {
-    await withTempFile("sample.ts", "aaa\nbbb\nccc\n", async ({ cwd, path }) => {
-      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
-      const insertTool = getTool("insert");
-      const editTool = getTool("replace");
-      const hashes = await lineHashes("aaa\nbbb\nccc\n", await resolveTarget(toCwd("sample.ts", cwd)));
-      await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx);
-      const payload = {
-        remove_from: hashes[1]!,
-        remove_to: hashes[1]!,
-        replacement_lines: ["bbb", "ccc"],
-      };
-
-      const first = await editTool.execute("e1", payload, undefined, undefined, ctx);
-      expect(first.details.classification).toBe("noop");
-
-      await insertTool.execute(
-        "i1",
-        { anchor: hashes[0]!, direction: "after", lines: ["AAA2"] },
-        undefined, undefined, ctx,
-      );
-      expect(await readFile(path, "utf-8")).toBe("aaa\nAAA2\nbbb\nccc\n");
-
-      const resend = await editTool.execute("e2", payload, undefined, undefined, ctx);
-      expect(resend.details.classification).toBe("noop");
-      expect(await readFile(path, "utf-8")).toBe("aaa\nAAA2\nbbb\nccc\n");
-    });
-  });
-
   it("expands a stringified lines array", async () => {
     await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
       const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
@@ -374,6 +345,24 @@ describe("insert tool", () => {
         { anchor: betaHash, direction: "after", lines: ['["beta1", "beta2",]'] },
         undefined, undefined, ctx,
       );
+      expect(result.content[0].text).toContain("Successfully inserted in sample.ts");
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\nbeta1\nbeta2\ngamma\n");
+    });
+  });
+
+  it("expands a method-chained stringified lines array", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const insertTool = getTool("insert");
+      const readResult = await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx);
+      const betaHash = extractHash(getText(readResult).split("\n").find((l) => l.includes("beta"))!);
+
+      const result = await insertTool.execute(
+        "i1",
+        { anchor: betaHash, direction: "after", lines: '["beta1", "beta2"].map(s => s)' },
+        undefined, undefined, ctx,
+      );
+
       expect(result.content[0].text).toContain("Successfully inserted in sample.ts");
       expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\nbeta1\nbeta2\ngamma\n");
     });

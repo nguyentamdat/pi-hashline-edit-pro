@@ -24,10 +24,9 @@ const EXEC_MAX_BYTES = 64 * 1024 * 1024;
 const SCAN_CONCURRENCY = 32;
 const SCAN_LIMIT_MULTIPLIER = 4;
 const MAX_REPORTED_OMISSIONS = 50;
-export const AUTO_READ_ALL_CHUNK_BYTES = 48 * 1024;
 
 const HEADER =
-  "[hashline auto-read-all] Every non-ignored project file is attached below with live hashline anchors. Do not call read for files in [files complete: ...]. Edit directly from the attachment with replace and insert.";
+  "[hashline auto-read-all] Every non-ignored project file is attached below as `=== path ===` then `anchor│content` rows with live anchors.\nEdit directly from the attachment with replace and insert; do not call read for files in [files complete: ...].\nFiles listed as omitted or not attached can be read normally.\nAnchors are case-sensitive and stay valid until their line is edited.";
 
 const IMAGE_EXTENSIONS = new Set([
   ".avif",
@@ -87,24 +86,17 @@ function isExcludedBySegment(path: string): boolean {
   }
   return false;
 }
+const EXCLUDED_PATTERN_SUFFIXES = [
+  ".min.js", ".min.css", ".min.mjs", "-min.js", "-min.css", ".umd.js", ".map", ".lock",
+  "_pb2.py", ".pb.go", ".g.dart", ".freezed.dart", ".designer.cs", ".g.cs", ".snap",
+];
+const EXCLUDED_PATTERN_INFIXES = [".bundle.", ".chunk.", ".generated.", ".gen."];
+
 function isExcludedByPattern(baseLower: string): boolean {
-  if (baseLower.endsWith(".min.js") || baseLower.endsWith(".min.css") || baseLower.endsWith(".min.mjs")) return true;
-  if (baseLower.endsWith("-min.js") || baseLower.endsWith("-min.css")) return true;
-  if (baseLower.includes(".bundle.") || baseLower.includes(".chunk.")) return true;
-  if (baseLower.endsWith(".umd.js")) return true;
-  if (baseLower.endsWith(".map")) return true;
-  if (baseLower.endsWith(".lock")) return true;
-  if (baseLower.includes(".generated.") || baseLower.includes(".gen.")) return true;
-  if (baseLower.endsWith("_pb2.py")) return true;
-  if (baseLower.endsWith(".pb.go")) return true;
-  if (baseLower.endsWith(".g.dart")) return true;
-  if (baseLower.endsWith(".freezed.dart")) return true;
-  if (baseLower.endsWith(".designer.cs")) return true;
-  if (baseLower.endsWith(".g.cs")) return true;
-  if (baseLower.endsWith(".snap")) return true;
-  if (baseLower.startsWith("coreui-icons.")) return true;
-  if (baseLower === "coreui.css") return true;
-  return false;
+  return EXCLUDED_PATTERN_SUFFIXES.some((suffix) => baseLower.endsWith(suffix))
+    || EXCLUDED_PATTERN_INFIXES.some((infix) => baseLower.includes(infix))
+    || baseLower.startsWith("coreui-icons.")
+    || baseLower === "coreui.css";
 }
 export function normalizeAutoReadAllIgnoreList(entries: readonly string[] | undefined): string[] {
   const seen = new Set<string>();
@@ -203,7 +195,6 @@ export interface AutoReadAllInjection {
   files: number;
   bytes: number;
   omitted: string[];
-  chunks: string[];
   completeFiles: number;
 }
 
@@ -371,24 +362,6 @@ export async function discoverAutoReadAllFiles(cwd: string, mode: AutoReadAllMod
   return { files, source, discovered: unique.length, skippedBinary, skippedLarge, skippedOther, skippedByName };
 }
 
-export function chunkAutoReadAllSections(sections: string[], maxBytes: number = AUTO_READ_ALL_CHUNK_BYTES): string[] {
-  const chunks: string[] = [];
-  let current: string[] = [];
-  let currentBytes = 0;
-  for (const section of sections) {
-    const sectionBytes = Buffer.byteLength(section, "utf-8") + 2;
-    if (current.length > 0 && currentBytes + sectionBytes > maxBytes) {
-      chunks.push(current.join("\n\n"));
-      current = [];
-      currentBytes = 0;
-    }
-    current.push(section);
-    currentBytes += sectionBytes;
-  }
-  if (current.length > 0) chunks.push(current.join("\n\n"));
-  return chunks;
-}
-
 async function candidateFileBytes(cwd: string, file: string): Promise<number | undefined> {
   try {
     const stats = await lstat(resolve(cwd, file));
@@ -462,12 +435,11 @@ export async function buildAutoReadAllInjection(cwd: string, budgetBytes: number
   }
   if (sections.length === 0) return undefined;
   const sectionTexts = sections.map((section) => section.text);
-  const chunks = chunkAutoReadAllSections(sectionTexts);
   const coverage = `[coverage: ${completeFiles} complete]`;
   const completeNames = sections.map((section) => section.file);
   const machineList = `[files complete: ${JSON.stringify(completeNames)} omitted: ${JSON.stringify(omitted)}]`;
   const text = `${HEADER}\n\n${coverage}\n${machineList}\n\n${sectionTexts.join("\n\n")}\n\n${buildFooter(sections.length, discovery, omitted)}`;
-  return { text, files: sections.length, bytes, omitted, chunks, completeFiles };
+  return { text, files: sections.length, bytes, omitted, completeFiles };
 }
 
 export function autoReadAllBudget(model: { contextWindow?: number } | undefined): number {

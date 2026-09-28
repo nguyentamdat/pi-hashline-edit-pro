@@ -16,7 +16,6 @@ import {
   type HEdit,
   type PlannedEdit,
 } from "./hashline";
-import { boundaryDedupNoopWarning, boundaryDedupWarning, dedupRowsFromFixes } from "./commit";
 import { adoptAnchors, servedForPath } from "./anchor-registry";
 import { restoreEndings, stripBOM, toLF, type LineEnding } from "./normalize";
 import { assertInsertReq, assertReq, normReq } from "./payload-contract";
@@ -62,11 +61,9 @@ export interface BatchPiece {
   toHash: string;
   newLines: string[];
   warnings: string[];
-  autoFixes: number;
-  dedupAbove: string[];
-  dedupBelow: string[];
   noop: boolean;
   foldedLines: number;
+  carryIndex?: number;
 }
 
 export interface BatchMemberInput {
@@ -79,8 +76,6 @@ export interface BatchMemberInput {
   signal?: AbortSignal;
   hedit: HEdit;
   extraWarnings: string[];
-  skipBoundaryDedup: boolean;
-  strictBoundaryDedup: boolean;
   foldedLines?: number;
 }
 
@@ -333,8 +328,7 @@ function formatBatchPiece(piece: BatchPiece): string {
 }
 
 function batchPlaceholder(member: PlannedMember, piece: BatchPiece, snapshotId: string | undefined): TResult {
-  const grossAdded = Math.max(0, piece.newLines.length - piece.autoFixes);
-  const added = piece.kind === "insert" ? Math.max(0, grossAdded - piece.foldedLines) : grossAdded;
+  const added = piece.kind === "insert" ? Math.max(0, piece.newLines.length - piece.foldedLines) : piece.newLines.length;
   const metrics: RMetrics = {
     edits_attempted: 1,
     edits_noop: piece.noop ? 1 : 0,
@@ -486,20 +480,12 @@ export async function executeBatchMember(input: BatchMemberInput): Promise<TResu
     planned = planEdit(base.content, input.hedit, base.hashes, {
       filePath: displayPath,
       servedHashes: runtime.served,
-      skipBoundaryDedup: input.skipBoundaryDedup,
-      strictBoundaryDedup: input.strictBoundaryDedup,
       signal: input.signal,
       baseFileLines: base.baseLines,
     });
   } catch (error) {
     if (error instanceof RangeStaleError) adoptAnchors(base.absolutePath, error.rangeServedMap);
     else if (error instanceof AnchorMismatchError) adoptAnchors(base.absolutePath, error.feedbackMap);
-    else if (error instanceof Error && error.message.startsWith("[E_BOUNDARY_STRICT]")) {
-      const indexed = new Error(`edit #${input.member.order} strict boundary-dedup rejection: ${error.message}`);
-      noteBatchFailure(input.member, indexed);
-      discardBatchState(runtime);
-      throw indexed;
-    }
     noteBatchFailure(input.member, error);
     discardBatchState(runtime);
     throw error;
@@ -510,23 +496,26 @@ export async function executeBatchMember(input: BatchMemberInput): Promise<TResu
   const baseLines = base.baseLines;
   const originalSlice = baseLines.slice(start - 1, end);
   const noop = originalSlice.length === newLines.length && originalSlice.every((line, index) => line === newLines[index]);
-  const fixes = planned.autoFixes ?? [];
-  const dedupRows = dedupRowsFromFixes(fixes);
+  const foldedLines = input.foldedLines ?? 0;
+  const carryIndex =
+    input.kind === "insert" && foldedLines > 0
+      ? input.direction === "after"
+        ? 0
+        : newLines.length - 1
+      : undefined;
   const piece: BatchPiece = {
     order: input.member.order,
     kind: input.kind,
     ...(input.direction !== undefined ? { direction: input.direction } : {}),
+    ...(carryIndex !== undefined ? { carryIndex } : {}),
     start,
     end,
     fromHash: input.hedit.hash_bounds[0].hash,
     toHash: input.hedit.hash_bounds[1].hash,
     newLines: [...newLines],
     warnings: [...input.extraWarnings, ...planned.warnings],
-    autoFixes: fixes.length,
-    dedupAbove: dedupRows.above,
-    dedupBelow: dedupRows.below,
     noop,
-    foldedLines: input.foldedLines ?? 0,
+    foldedLines,
   };
   runtime.pieces.push(piece);
   if (input.kind === "replace") runtime.replaceCount += 1;
@@ -585,21 +574,19 @@ function mergeInsertPairs(pieces: BatchPiece[]): BatchPiece[] {
       order: Math.min(before.order, after.order),
       newLines: [...before.newLines, ...after.newLines.slice(1)],
       warnings: [...before.warnings, ...after.warnings],
-      autoFixes: before.autoFixes + after.autoFixes,
-      dedupAbove: [...before.dedupAbove, ...after.dedupAbove],
-      dedupBelow: [...before.dedupBelow, ...after.dedupBelow],
       foldedLines: before.foldedLines + after.foldedLines - 1,
     });
   }
   return merged;
 }
 
-function dedupCutNoops(pieces: BatchPiece[]): BatchPiece[] {
-  return pieces.filter((piece) => piece.noop && piece.autoFixes > 0).sort((a, b) => a.order - b.order);
-}
-
-function dedupCutNoopWarning(noops: BatchPiece[]): string {
-  return boundaryDedupNoopWarning(noops.map((piece) => piece.order), noops.reduce((sum, piece) => sum + piece.autoFixes, 0));
+function pieceMappingSpans(pieces: BatchPiece[]): { start: number; end: number; replacementCount: number; carry?: number }[] {
+  return pieces.map((piece) => ({
+    start: piece.start - 1,
+    end: piece.end - 1,
+    replacementCount: piece.newLines.length,
+    ...(piece.carryIndex !== undefined ? { carry: piece.carryIndex } : {}),
+  }));
 }
 
 async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise<TResult> {
@@ -624,9 +611,8 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
   }
   const appliedPieces = runtime.pieces.filter((piece) => !piece.noop);
   if (appliedPieces.length === 0) {
-    const dedupNoops = dedupCutNoops(runtime.pieces);
     const snapshotId = await safeSnapId(paths.absolutePath, "noop edit");
-    return combinedNoop(paths.displayPath, member, runtime, snapshotId, dedupNoops);
+    return combinedNoop(paths.displayPath, member, runtime, snapshotId);
   }
   const effectivePieces = mergeInsertPairs(appliedPieces);
   const ordered = [...effectivePieces].sort((a, b) => a.start - b.start);
@@ -641,10 +627,6 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
   const composed = composeBatchLines(base.content, effectivePieces);
   const warnings = [...runtime.warnings];
   if (base.hadUtf8DecodeErrors) warnings.push("Non-UTF-8 bytes were shown as U+FFFD; this edit rewrote the file as UTF-8.");
-  const dedupTotal = effectivePieces.reduce((sum, piece) => sum + piece.autoFixes, 0);
-  if (dedupTotal > 0) warnings.push(boundaryDedupWarning(dedupTotal));
-  const dedupNoops = dedupCutNoops(runtime.pieces);
-  if (dedupNoops.length > 0) warnings.push(dedupCutNoopWarning(dedupNoops));
   try {
     await throwIfStrictInput(dedupeWarnings(warnings));
     assertNotEmpty(base.content, composed);
@@ -658,7 +640,7 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
   }
   if (composed === base.content) {
     const snapshotId = await safeSnapId(paths.absolutePath, "noop edit");
-    return combinedNoop(paths.displayPath, member, runtime, snapshotId, dedupNoops);
+    return combinedNoop(paths.displayPath, member, runtime, snapshotId);
   }
   abortIf(signal);
   let currentRaw: string;
@@ -673,7 +655,7 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     discardBatchState(runtime);
     throw new Error(`[E_OP_ABORTED] Batch ${runtime.display} aborted: the file changed after the batch started. Call read for fresh anchors and retry.`);
   }
-  const preflightSpans = effectivePieces.map((piece) => ({ start: piece.start - 1, end: piece.end - 1, replacementCount: piece.newLines.length }));
+  const preflightSpans = pieceMappingSpans(effectivePieces);
   try {
     await lineHashes(composed, runtime.target, {
       content: base.content,
@@ -706,7 +688,7 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     throw error;
   }
   const updatedSnapshotId = await safeSnapId(paths.absolutePath, "post-edit");
-  const spans = effectivePieces.map((piece) => ({ start: piece.start - 1, end: piece.end - 1, replacementCount: piece.newLines.length, dedupAbove: piece.dedupAbove, dedupBelow: piece.dedupBelow }));
+  const spans = pieceMappingSpans(effectivePieces);
   let resultHashes: string[];
   try {
     resultHashes = await lineHashes(composed, runtime.target, {
@@ -723,11 +705,8 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
   let removed = 0;
   for (const piece of appliedPieces) {
     removed += piece.end - piece.start + 1;
-    const gross = Math.max(0, piece.newLines.length - piece.autoFixes);
-    added += piece.kind === "insert" ? Math.max(0, gross - piece.foldedLines) : gross;
+    added += piece.kind === "insert" ? Math.max(0, piece.newLines.length - piece.foldedLines) : piece.newLines.length;
   }
-  const dedupAboveRows = ordered.flatMap((piece) => piece.dedupAbove);
-  const dedupBelowRows = ordered.flatMap((piece) => piece.dedupBelow);
   const header = batchHeader(member);
   const changed = buildChanged(
     {
@@ -746,8 +725,6 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
         addedLines: added,
         removedLines: removed,
       },
-      boundaryDedupAbove: dedupAboveRows,
-      boundaryDedupBelow: dedupBelowRows,
       spans,
     },
     batchVerb(runtime),
@@ -766,10 +743,9 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
   return changed;
 }
 
-async function combinedNoop(path: string, member: PlannedMember, runtime: BatchState, snapshotId: string | undefined, dedupNoops: BatchPiece[]): Promise<TResult> {
+async function combinedNoop(path: string, member: PlannedMember, runtime: BatchState, snapshotId: string | undefined): Promise<TResult> {
   const executed = runtime.applied + runtime.noops;
   const warnings = [...runtime.warnings];
-  if (dedupNoops.length > 0) warnings.push(dedupCutNoopWarning(dedupNoops));
   const noop = buildNoop(
     {
       path,
@@ -782,7 +758,6 @@ async function combinedNoop(path: string, member: PlannedMember, runtime: BatchS
         removedLines: 0,
       },
       warnings: dedupeWarnings(warnings),
-      boundaryRemovedLines: 0,
     },
     "Batch",
   );

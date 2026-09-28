@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, readFile, rename, mkdir, stat } from "node:fs/promises";
 import { hashStorePath, hashStoreDir, legacyHashStorePath } from "./paths";
-import { errCode, isRec, splitLines } from "./utils";
+import { errCode, isModeUnsupported, isRec, splitLines } from "./utils";
 import { initHasher, contentChecksum, lineChecksum } from "./hashline/hasher";
 import { HASH_STORE_VERSION, HASH_STORE_BUSY_TIMEOUT } from "./constants";
 import {
@@ -278,7 +278,11 @@ async function openStore(storePath: string): Promise<HashStore> {
   await initHasher();
   await mkdir(hashStoreDir(), { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") {
-    await chmod(hashStoreDir(), 0o700);
+    try {
+      await chmod(hashStoreDir(), 0o700);
+    } catch (error) {
+      if (errCode(error) !== "ENOENT" && !isModeUnsupported(error)) throw error;
+    }
   }
 
   let existed = existsSync(storePath);
@@ -319,7 +323,7 @@ async function openStore(storePath: string): Promise<HashStore> {
       try {
         await chmod(candidate, 0o600);
       } catch (error) {
-        if (errCode(error) !== "ENOENT") throw error;
+        if (errCode(error) !== "ENOENT" && !isModeUnsupported(error)) throw error;
       }
     }
   }
@@ -529,6 +533,7 @@ export function getAllocatedState(store: HashStore, path: string, deleteCorrupt 
       checksums = undefined;
     }
   }
+  if (checksums !== undefined && checksums.length !== parsedAnchors.length) return undefined;
   return { anchors: parsedAnchors, checksums, contentChecksum: row.checksum };
 }
 
@@ -550,8 +555,13 @@ export function getUndoEntry(store: HashStore, path: string): UndoRecord | undef
   if (!row) return undefined;
   const parsed = parseStoredHashes(row, () => store.stmts.undoDelete(path));
   if (!parsed) return undefined;
+  const content = row.content as string;
+  if (splitLines(content).length !== parsed.length) {
+    store.stmts.undoDelete(path);
+    return undefined;
+  }
   return {
-    content: row.content as string,
+    content,
     bom: row.bom as string,
     ending: row.ending as string,
     hashes: parsed,

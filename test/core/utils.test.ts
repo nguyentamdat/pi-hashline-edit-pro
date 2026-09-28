@@ -3,14 +3,11 @@ import {
   isRec,
   visLines,
   rejectUnknownFields,
-  lastNonEmptyIndex,
-  firstNonEmptyIndex,
-  lastNonEmpty,
-  firstNonEmpty,
   makePrepareArguments,
   truncateToBytes,
   decodeStringArray,
   assertByteLimit,
+  isModeUnsupported,
 } from "../../src/utils";
 
 describe("isRec", () => {
@@ -167,110 +164,6 @@ describe("rejectUnknownFields", () => {
     expect(() => rejectUnknownFields(obj, allowed, "Request")).toThrow(
       /z, a, m/,
     );
-  });
-});
-
-describe("lastNonEmptyIndex", () => {
-  it("returns -1 for empty array", () => {
-    expect(lastNonEmptyIndex([])).toBe(-1);
-  });
-
-  it("returns -1 for all-empty lines", () => {
-    expect(lastNonEmptyIndex(["", "", ""])).toBe(-1);
-  });
-
-  it("returns index of last non-empty line", () => {
-    expect(lastNonEmptyIndex(["a", "", "b"])).toBe(2);
-  });
-
-  it("finds last non-empty when there are trailing empty lines", () => {
-    expect(lastNonEmptyIndex(["a", "b", "", ""])).toBe(1);
-  });
-
-  it("returns index of the only non-empty line", () => {
-    expect(lastNonEmptyIndex(["", "x", ""])).toBe(1);
-  });
-
-  it("handles a single non-empty line", () => {
-    expect(lastNonEmptyIndex(["hello"])).toBe(0);
-  });
-});
-
-describe("firstNonEmptyIndex", () => {
-  it("returns -1 for empty array", () => {
-    expect(firstNonEmptyIndex([])).toBe(-1);
-  });
-
-  it("returns -1 for all-empty lines", () => {
-    expect(firstNonEmptyIndex(["", "", ""])).toBe(-1);
-  });
-
-  it("returns index of first non-empty line", () => {
-    expect(firstNonEmptyIndex(["", "a", "b"])).toBe(1);
-  });
-
-  it("finds first non-empty when there are leading empty lines", () => {
-    expect(firstNonEmptyIndex(["", "", "a", "b"])).toBe(2);
-  });
-
-  it("returns index of the only non-empty line", () => {
-    expect(firstNonEmptyIndex(["", "x", ""])).toBe(1);
-  });
-
-  it("handles a single non-empty line", () => {
-    expect(firstNonEmptyIndex(["hello"])).toBe(0);
-  });
-});
-
-describe("lastNonEmpty", () => {
-  it("returns undefined for empty array", () => {
-    expect(lastNonEmpty([])).toBeUndefined();
-  });
-
-  it("returns undefined for all-empty lines", () => {
-    expect(lastNonEmpty(["", "", ""])).toBeUndefined();
-  });
-
-  it("returns content of last non-empty line", () => {
-    expect(lastNonEmpty(["a", "", "b"])).toBe("b");
-  });
-
-  it("finds last non-empty when there are trailing empty lines", () => {
-    expect(lastNonEmpty(["a", "b", "", ""])).toBe("b");
-  });
-
-  it("returns content of the only non-empty line", () => {
-    expect(lastNonEmpty(["", "x", ""])).toBe("x");
-  });
-
-  it("handles a single non-empty line", () => {
-    expect(lastNonEmpty(["hello"])).toBe("hello");
-  });
-});
-
-describe("firstNonEmpty", () => {
-  it("returns undefined for empty array", () => {
-    expect(firstNonEmpty([])).toBeUndefined();
-  });
-
-  it("returns undefined for all-empty lines", () => {
-    expect(firstNonEmpty(["", "", ""])).toBeUndefined();
-  });
-
-  it("returns content of first non-empty line", () => {
-    expect(firstNonEmpty(["", "a", "b"])).toBe("a");
-  });
-
-  it("finds first non-empty when there are leading empty lines", () => {
-    expect(firstNonEmpty(["", "", "a", "b"])).toBe("a");
-  });
-
-  it("returns content of the only non-empty line", () => {
-    expect(firstNonEmpty(["", "x", ""])).toBe("x");
-  });
-
-  it("handles a single non-empty line", () => {
-    expect(firstNonEmpty(["hello"])).toBe("hello");
   });
 });
 
@@ -451,6 +344,28 @@ describe("decodeStringArray leniency", () => {
     expect(decodeStringArray("[,]")).toBeUndefined();
     expect(decodeStringArray('["a", ,]')).toBeUndefined();
   });
+
+  it("unwraps a stringified array followed by a JS method call", () => {
+    expect(decodeStringArray('["alpha", "beta"].map(s => s)')).toEqual(["alpha", "beta"]);
+    expect(decodeStringArray('["alpha", "beta"].slice(0, 1)')).toEqual(["alpha", "beta"]);
+    expect(decodeStringArray(['["alpha"].map(s => s)'])).toEqual(["alpha"]);
+    expect(decodeStringArray('["alpha", "beta",].map(s => s)')).toEqual(["alpha", "beta"]);
+  });
+
+  it("warns for a malformed stringified array of strings", () => {
+    const warnings: string[] = [];
+    expect(decodeStringArray('["alpha", 7].map(s => s)', warnings)).toBeUndefined();
+    expect(decodeStringArray('["alpha", 7', warnings)).toBeUndefined();
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain("looked like a JSON array");
+    expect(warnings[1]).toContain("looked like a JSON array");
+  });
+
+  it("does not warn for an envelope line that parseText unwraps", () => {
+    const warnings: string[] = [];
+    expect(decodeStringArray('["  "version": "2.8.4","].', warnings)).toBeUndefined();
+    expect(warnings).toHaveLength(0);
+  });
 });
 
 describe("decodeStringArray control bytes", () => {
@@ -484,5 +399,15 @@ describe("assertByteLimit", () => {
   it("reports the exceeded limit in megabytes", () => {
     const oneMb = 1024 * 1024;
     expect(() => assertByteLimit("a".repeat(oneMb + 1), "f.txt", oneMb)).toThrow(/exceeds the 1MB size limit/);
+  });
+});
+
+describe("isModeUnsupported", () => {
+  it("classifies filesystem mode-enforcement failures", () => {
+    expect(isModeUnsupported(Object.assign(new Error("denied"), { code: "EPERM" }))).toBe(true);
+    expect(isModeUnsupported(Object.assign(new Error("denied"), { code: "ENOTSUP" }))).toBe(true);
+    expect(isModeUnsupported(Object.assign(new Error("denied"), { code: "EOPNOTSUPP" }))).toBe(true);
+    expect(isModeUnsupported(Object.assign(new Error("denied"), { code: "EACCES" }))).toBe(false);
+    expect(isModeUnsupported(new Error("denied"))).toBe(false);
   });
 });

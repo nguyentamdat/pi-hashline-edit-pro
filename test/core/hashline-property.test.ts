@@ -5,20 +5,18 @@ import {
   lineHashes,
   resEdit,
 } from "../../src/hashline";
-import { firstNonEmpty, lastNonEmpty, splitLines } from "../../src/utils";
+import { splitLines } from "../../src/utils";
 import { useTestHome, expectedEditContent } from "../support/fixtures";
 
-const home = useTestHome();
-
-function replayFixes(
-	repl: string[],
-	autoFixes: { removedLineIndex: number }[] | undefined,
-): string[] {
-	if (!autoFixes) return repl;
-	const corrected = [...repl];
-	for (const fix of autoFixes) corrected.splice(fix.removedLineIndex, 1);
-	return corrected;
+function firstNonEmptyLine(lines: string[]): string | undefined {
+  return lines.find((line) => line.length > 0);
 }
+
+function lastNonEmptyLine(lines: string[]): string | undefined {
+  return lines.findLast((line) => line.length > 0);
+}
+
+const home = useTestHome();
 
 const VOCAB = [
   "",
@@ -80,14 +78,14 @@ function randSpan(
       (isEofDeletion(other) && isMidDeletion(span) && span.e === other.s - 1) ||
       (isEofDeletion(span) && isMidDeletion(other) && other.e === span.s - 1),
     )) continue;
-    const first = firstNonEmpty(repl);
-    const last = lastNonEmpty(repl);
+    const first = firstNonEmptyLine(repl);
+    const last = lastNonEmptyLine(repl);
     const prev = s >= 2 ? lines[s - 2] : undefined;
     const next = e < n ? lines[e] : undefined;
     if ((first !== undefined && first === prev) || (last !== undefined && last === next)) continue;
     if (avoid.some((other) =>
-      (first !== undefined && other.e === s - 1 && lastNonEmpty(other.repl) === first) ||
-      (last !== undefined && other.s === e + 1 && firstNonEmpty(other.repl) === last),
+      (first !== undefined && other.e === s - 1 && lastNonEmptyLine(other.repl) === first) ||
+      (last !== undefined && other.s === e + 1 && firstNonEmptyLine(other.repl) === last),
     )) continue;
     if (repl.length === 0 && s === 1 && e === n) continue;
     return span;
@@ -158,13 +156,13 @@ describe("property: single random edit per call", () => {
       });
       const result = applyEdit(content, edit, undefined, hashes, home.testPath);
       const correctedExpected = expectedEditContent(
-        lines, span.s, span.e, replayFixes(span.repl, result.autoFixes), content.endsWith("\n"),
+        lines, span.s, span.e, span.repl, content.endsWith("\n"),
       );
       expect(result.content).toBe(correctedExpected);
       const resultHashes = await lineHashes(correctedExpected, home.testPath, {
         content,
         hashes,
-        spans: [{ start: span.s - 1, end: span.e - 1, replacementCount: replayFixes(span.repl, result.autoFixes).length }],
+        spans: [{ start: span.s - 1, end: span.e - 1, replacementCount: span.repl.length }],
       });
       assertMappingInvariants(
         lines,
@@ -200,7 +198,7 @@ describe("property: sequential random edits", () => {
           replacement_lines: span.repl,
         });
         const result = applyEdit(current, edit, undefined, currentHashes, home.testPath);
-        applied.push({ s: span.s, e: span.e, repl: replayFixes(span.repl, result.autoFixes) });
+        applied.push({ s: span.s, e: span.e, repl: span.repl });
         current = result.content;
       }
       let expectedLines = lines;
@@ -287,13 +285,13 @@ describe("property: chained stable mapping at every step", () => {
         }
         if (result.content === content) continue;
         const expected = expectedEditContent(
-          lines, span.s, span.e, replayFixes(span.repl, result.autoFixes), content.endsWith("\n"),
+          lines, span.s, span.e, span.repl, content.endsWith("\n"),
         );
         expect(result.content).toBe(expected);
         const nextHashes = await lineHashes(expected, chainPath, {
           content,
           hashes,
-          spans: [{ start: span.s - 1, end: span.e - 1, replacementCount: replayFixes(span.repl, result.autoFixes).length }],
+          spans: [{ start: span.s - 1, end: span.e - 1, replacementCount: span.repl.length }],
         });
         expect(nextHashes).toHaveLength(splitLines(expected).length);
         assertMappingInvariants(

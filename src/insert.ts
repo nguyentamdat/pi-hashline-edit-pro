@@ -119,7 +119,6 @@ export async function insertPreview(request: unknown, cwd: string, signal?: Abor
       accessMode: constants.R_OK,
       noPersist: true,
       preloadedNorm: preload,
-      skipBoundaryDedup: true,
       signal,
     });
     return previewFromPipe(pipe);
@@ -224,8 +223,6 @@ export function buildInsertToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): I
               signal,
               hedit,
               extraWarnings: [...anchorWarnings, ...insertWarnings, ...resWarnings],
-              skipBoundaryDedup: true,
-              strictBoundaryDedup: false,
               foldedLines: built.anchorLine === undefined ? 0 : 1,
             });
           }
@@ -239,12 +236,15 @@ export function buildInsertToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): I
             accessMode: constants.R_OK | constants.W_OK,
             signal,
             preloadedNorm: preload,
-            skipBoundaryDedup: true,
           });
           return commitEdit(pipe, {
             path: pipe.path,
             absolutePath,
             mutationTargetPath,
+            editAnchors: [editParams.remove_from, editParams.remove_to],
+            ...(anchorLine === undefined
+              ? {}
+              : { anchorCarry: req.direction === "after" ? 0 : editParams.replacement_lines.length - 1 }),
             signal,
             verb: "inserted",
             noopNoun: "Insertion",
