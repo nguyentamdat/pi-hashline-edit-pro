@@ -1,1 +1,1 @@
-Insert a text block after or before an anchor line: the anchor line stays; `lines` is the exact text without anchor prefixes
+Insert `lines` after/before bare anchor `Hasu` from `Hasu│content`: anchor stays, lines are bare without `│`, one per element
