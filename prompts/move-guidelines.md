@@ -1,0 +1,1 @@
+- `move`: a cross-file move records one undo entry per file — undo both sides. Lines between source and target may be re-anchored.

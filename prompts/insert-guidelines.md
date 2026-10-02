@@ -1,1 +1,1 @@
-
+- `insert`: after inserting a quoted payload, check the post-edit diff for an extra `+anchor│` blank row before the next line.

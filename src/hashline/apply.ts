@@ -11,6 +11,7 @@ import {
 	type RHEdit,
 	type NEdit,
 	type HEdit,
+	type StripWarningLocation,
 } from "./resolve";
 
 type LIdx = {
@@ -67,12 +68,12 @@ function resToSpan(
   const startLine = edit.hash_bounds[0].line;
   const endLine = edit.hash_bounds[1].line;
   const originalLines = fileLines.slice(startLine - 1, endLine);
-  if (
+  const contentUnchanged =
     originalLines.length === edit.content_lines.length &&
     originalLines.every(
       (line, lineIndex) => line === edit.content_lines[lineIndex],
-    )
-  ) {
+    );
+  if (contentUnchanged && edit.content_separators === undefined) {
     return {
       kind: "noop",
       loc: edit.hash_bounds[0].hash,
@@ -81,7 +82,9 @@ function resToSpan(
   }
 
   if (edit.content_lines.length > 0) {
-    const lastReplacementLine = edit.content_lines[edit.content_lines.length - 1]!;
+    const lastIndex = edit.content_lines.length - 1;
+    const lastReplacementLine = edit.content_lines[lastIndex]!;
+    const lastEnding = edit.content_separators?.[lastIndex];
     const endsWithBlank = lastReplacementLine.length === 0;
     const endsAtEofWithoutNewline =
       endLine === fileLines.length && !content.endsWith("\n");
@@ -91,7 +94,7 @@ function resToSpan(
       start: lineStarts[startLine - 1]!,
       end: lineStarts[endLine - 1]! + fileLines[endLine - 1]!.length,
       replacement:
-        endsAtEofWithoutNewline && endsWithBlank
+        endsAtEofWithoutNewline && (endsWithBlank || lastEnding !== undefined)
           ? `${replacement}\n`
           : replacement,
     };
@@ -160,6 +163,7 @@ export function planEdit(
     servedHashes?: ReadonlyMap<string, string>;
     signal?: AbortSignal;
     baseFileLines?: string[];
+    stripWarning?: StripWarningLocation;
   },
 ): PlannedEdit {
   const signal = options?.signal;
@@ -171,8 +175,9 @@ export function planEdit(
 
   const rangeFixed = swapReversedRanges(edit, fileHashes);
   const prefixFixed = stripDiffPrefixes(
-    stripBarePrefixes(rangeFixed, warnings),
+    stripBarePrefixes(rangeFixed, warnings, options?.stripWarning),
     warnings,
+    options?.stripWarning,
   );
 
   const { resolved: initialResolved, mismatches } = valEdit(
@@ -213,6 +218,8 @@ export function applyEdit(
 	precomputedHashes?: string[],
 	filePath?: string,
 	servedHashes?: ReadonlyMap<string, string>,
+	allowEmpty = false,
+	stripWarning?: StripWarningLocation,
 	): {
 	content: string;
 	firstChangedLine: number | undefined;
@@ -224,7 +231,7 @@ export function applyEdit(
   if (precomputedHashes === undefined) {
     throw new Error("[E_BAD_SHAPE] applyEdit requires the file's allocated anchors; derive them via lineHashes(content, path) first.");
   }
-  const planned = planEdit(content, edit, precomputedHashes, { filePath, servedHashes, signal });
+  const planned = planEdit(content, edit, precomputedHashes, { filePath, servedHashes, signal, stripWarning });
   const lineIndex = buildIdx(content);
   const warnings = planned.warnings;
   const resolved = planned.resolved;
@@ -240,7 +247,7 @@ export function applyEdit(
 	}
 
 	const result = assemble(content, spanResult, signal);
-	assertNotEmpty(content, result);
+	if (!allowEmpty) assertNotEmpty(content, result);
 	const range = changedRange(content, result);
 
 	return {

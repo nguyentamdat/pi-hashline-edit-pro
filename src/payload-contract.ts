@@ -1,29 +1,24 @@
 import { Type } from "typebox";
-import { isRec, normalizeRequest, rejectUnknownFields, assertNoNul } from "./utils";
+import { isRec, normalizeFilePath, normalizeRequest, rejectUnknownFields, assertNoNul } from "./utils";
+import { LINES_NOT_STRING_MSG, NEW_CONTENT_NOT_STRING_MSG } from "./constants";
 
-const replacementLinesSchema = Type.Array(
-  Type.String({
-    description:
-      "One replacement line; never embed \\n inside an element.",
-  }),
-  {
-    description:
-      "One string per line. Use [] to delete the range; [\"\"] is a single blank line.",
-  },
-);
+const replacementLinesSchema = Type.String({
+  description:
+    'The exact text to write in place of the removed range. "" deletes the range, "\\n" is one blank line, and a trailing line break sets the last line\'s ending instead of adding a blank line.',
+});
 
 const removeFromSchema = Type.String({
   description:
-    "Bare 4-char anchor from a served anchor│content row (the text before the `│` separator), never the row content. Marks the FIRST line to remove (inclusive)",
+    "4-char anchor of the FIRST line to remove (never the row content).",
 });
 
 const removeToSchema = Type.String({
   description:
-    "Bare 4-char anchor from a served anchor│content row (the text before the `│` separator), never the row content. Marks the LAST line to remove (inclusive)",
+    "4-char anchor of the LAST line to remove.",
 });
 const pathRequiredSchema = Type.String({
   description:
-    "Path to the file the anchors were served for; required and must match anchor ownership. Anchors still resolve the target.",
+    "Path to the file the anchors were served for; required and must match anchor ownership.",
 });
 
 export const editToolSchema = Type.Object(
@@ -52,7 +47,14 @@ export type ReqParams = {
   path?: string;
   remove_from: string;
   remove_to: string;
-  replacement_lines: string[];
+  replacement_lines: string;
+};
+
+export type RawReqParams = {
+  path?: string;
+  remove_from: string;
+  remove_to: string;
+  replacement_lines: string | string[];
 };
 
 const ROOT_KS = new Set(["path", "remove_from", "remove_to", "replacement_lines"]);
@@ -66,20 +68,21 @@ export function assertReq(request: unknown): asserts request is ReqParams {
   }
   if (
     typeof request.remove_from !== "string" ||
-    typeof request.remove_to !== "string" ||
-    !Array.isArray(request.replacement_lines) ||
-    request.replacement_lines.some((line) => typeof line !== "string")
+    typeof request.remove_to !== "string"
   ) {
     throw new Error(
-      '[E_BAD_SHAPE] Edit request requires "remove_from", "remove_to", and "replacement_lines" (array of strings, one per line; use [] to delete).',
+      '[E_BAD_SHAPE] Edit request requires "remove_from" and "remove_to" anchor strings and a "replacement_lines" string with the exact text to write.',
     );
   }
-  assertNoNul(request.replacement_lines);
+  if (typeof request.replacement_lines !== "string") {
+    throw new Error(NEW_CONTENT_NOT_STRING_MSG);
+  }
+  assertNoNul([request.replacement_lines]);
 }
 
 export { normalizeRequest as normReq } from "./utils";
 
-export function getPreviewInput(args: unknown): { path?: string; remove_from: string; remove_to: string; replacement_lines: string[] } | null {
+export function getPreviewInput(args: unknown): { path?: string; remove_from: string; remove_to: string; replacement_lines: string } | null {
   let normalized: unknown;
   try {
     normalized = normalizeRequest(args);
@@ -90,8 +93,7 @@ export function getPreviewInput(args: unknown): { path?: string; remove_from: st
   if (
     typeof normalized.remove_from !== "string" ||
     typeof normalized.remove_to !== "string" ||
-    !Array.isArray(normalized.replacement_lines) ||
-    normalized.replacement_lines.some((line) => typeof line !== "string")
+    typeof normalized.replacement_lines !== "string"
   ) {
     return null;
   }
@@ -99,7 +101,7 @@ export function getPreviewInput(args: unknown): { path?: string; remove_from: st
     ...(typeof normalized.path === "string" ? { path: normalized.path } : {}),
     remove_from: normalized.remove_from as string,
     remove_to: normalized.remove_to as string,
-    replacement_lines: normalized.replacement_lines as string[],
+    replacement_lines: normalized.replacement_lines,
   };
 }
 
@@ -109,7 +111,7 @@ export interface InsertReq {
   path?: string;
   anchor: string;
   direction: "before" | "after";
-  lines: string[];
+  lines: string;
 }
 
 export function assertInsertReq(request: unknown): asserts request is InsertReq {
@@ -126,8 +128,161 @@ export function assertInsertReq(request: unknown): asserts request is InsertReq 
   if (request.direction !== "before" && request.direction !== "after") {
     throw new Error('[E_BAD_SHAPE] Insert request "direction" must be "before" or "after".');
   }
-  if (!Array.isArray(request.lines) || request.lines.some((line) => typeof line !== "string")) {
-    throw new Error('[E_BAD_SHAPE] Insert request requires "lines" as an array of strings, one element per line.');
+  if (typeof request.lines !== "string") {
+    throw new Error(LINES_NOT_STRING_MSG);
   }
-  assertNoNul(request.lines);
+  assertNoNul([request.lines]);
+}
+
+const TRANSFER_KEYS = new Set(["path", "source_from", "source_to", "insert_after"]);
+
+export interface TransferReq {
+  path?: string;
+  source_from: string;
+  source_to: string;
+  insert_after: string;
+}
+
+export function assertTransferReq(request: unknown): asserts request is TransferReq {
+  if (!isRec(request)) {
+    throw new Error("[E_BAD_SHAPE] Copy/move request must be an object.");
+  }
+  rejectUnknownFields(request, TRANSFER_KEYS, "Copy/move request");
+  if (request.path !== undefined && typeof request.path !== "string") {
+    throw new Error('[E_BAD_SHAPE] Copy/move request field "path" must be a string when provided.');
+  }
+  if (typeof request.source_from !== "string" || request.source_from.length === 0) {
+    throw new Error('[E_BAD_SHAPE] Copy/move request requires a "source_from" string (4-char anchor from read output).');
+  }
+  if (typeof request.source_to !== "string" || request.source_to.length === 0) {
+    throw new Error('[E_BAD_SHAPE] Copy/move request requires a "source_to" string (4-char anchor from read output).');
+  }
+  if (typeof request.insert_after !== "string" || request.insert_after.length === 0) {
+    throw new Error('[E_BAD_SHAPE] Copy/move request requires an "insert_after" string (4-char anchor from read output).');
+  }
+}
+
+const WITHIN_KS = new Set(["path", "replace_from", "replace_to", "replace_old", "replace_new"]);
+
+export interface ReplaceWithinReq {
+  path?: string;
+  replace_from: string;
+  replace_to: string;
+  replace_old: string;
+  replace_new: string;
+}
+
+export function assertReplaceWithinReq(request: unknown): asserts request is ReplaceWithinReq {
+  if (!isRec(request)) {
+    throw new Error("[E_BAD_SHAPE] Replace-within request must be an object.");
+  }
+  rejectUnknownFields(request, WITHIN_KS, "Replace-within request");
+  if (request.path !== undefined && typeof request.path !== "string") {
+    throw new Error('[E_BAD_SHAPE] Replace-within request field "path" must be a string when provided.');
+  }
+  for (const key of ["replace_from", "replace_to", "replace_old", "replace_new"] as const) {
+    if (typeof (request as Record<string, unknown>)[key] !== "string") {
+      throw new Error(`[E_BAD_SHAPE] Replace-within request requires a "${key}" string.`);
+    }
+  }
+  const within = request as unknown as ReplaceWithinReq;
+  if (within.replace_from.length === 0 || within.replace_to.length === 0) {
+    throw new Error('[E_BAD_SHAPE] Replace-within request requires non-empty "replace_from" and "replace_to" anchors.');
+  }
+  if (within.replace_old.length === 0) {
+    throw new Error('[E_BAD_SHAPE] Replace-within request field "replace_old" must be a non-empty string holding the exact text to find.');
+  }
+  assertNoNul([within.replace_new]);
+}
+
+const WITHIN_ANCHOR_ALIASES: Array<[string, "replace_from" | "replace_to"]> = [
+  ["replace_from", "replace_from"],
+  ["remove_from", "replace_from"],
+  ["from", "replace_from"],
+  ["replace_to", "replace_to"],
+  ["remove_to", "replace_to"],
+  ["to", "replace_to"],
+];
+
+export function normalizeReplaceWithinRequest(input: unknown): unknown {
+  if (!isRec(input)) return input;
+  const record: Record<string, unknown> = { ...input };
+  normalizeFilePath(record);
+  for (const [alias, canonical] of WITHIN_ANCHOR_ALIASES) {
+    if (typeof record[canonical] !== "string" && typeof record[alias] === "string") {
+      record[canonical] = record[alias];
+    }
+    if (alias !== canonical) delete record[alias];
+  }
+  return record;
+}
+
+export function getReplaceWithinInput(args: unknown): { path?: string; replace_from: string; replace_to: string; replace_old: string; replace_new: string } | null {
+  let normalized: unknown;
+  try {
+    normalized = normalizeReplaceWithinRequest(args);
+  } catch {
+    return null;
+  }
+  if (!isRec(normalized)) return null;
+  if (
+    typeof normalized.replace_from !== "string" ||
+    typeof normalized.replace_to !== "string" ||
+    typeof normalized.replace_old !== "string" ||
+    typeof normalized.replace_new !== "string"
+  ) {
+    return null;
+  }
+  return {
+    ...(typeof normalized.path === "string" ? { path: normalized.path } : {}),
+    replace_from: normalized.replace_from,
+    replace_to: normalized.replace_to,
+    replace_old: normalized.replace_old,
+    replace_new: normalized.replace_new,
+  };
+}
+
+const replaceWithinFromSchema = Type.String({
+  description:
+    "4-char anchor of the FIRST line of the range searched (never the row content).",
+});
+const replaceWithinToSchema = Type.String({
+  description:
+    "4-char anchor of the LAST line of the range searched; same as replace_from for a single line.",
+});
+const replaceWithinOldSchema = Type.String({
+  description:
+    "The exact text to find inside the selected line(s), copied from the served row. It must occur exactly once; the text around it is left untouched. Matching uses LF line breaks and excludes the last line's terminator.",
+});
+const replaceWithinNewSchema = Type.String({
+  description:
+    'The exact replacement for the matched text. "" deletes the match, "\\n" inserts one blank line, and a trailing line break sets the last line\'s ending instead of adding a blank line; the rest of the range is kept byte-for-byte.',
+});
+const replaceWithinPathRequiredSchema = Type.String({
+  description:
+    "Path to the file the anchors were served for; required and must match anchor ownership.",
+});
+
+export const replaceWithinToolSchema = Type.Object(
+  {
+    replace_from: replaceWithinFromSchema,
+    replace_to: replaceWithinToSchema,
+    replace_old: replaceWithinOldSchema,
+    replace_new: replaceWithinNewSchema,
+  },
+  { additionalProperties: true },
+);
+
+export function buildReplaceWithinToolSchema(requirePath: boolean): typeof replaceWithinToolSchema {
+  if (!requirePath) return replaceWithinToolSchema;
+  return Type.Object(
+    {
+      path: replaceWithinPathRequiredSchema,
+      replace_from: replaceWithinFromSchema,
+      replace_to: replaceWithinToSchema,
+      replace_old: replaceWithinOldSchema,
+      replace_new: replaceWithinNewSchema,
+    },
+    { additionalProperties: true },
+  ) as typeof replaceWithinToolSchema;
 }

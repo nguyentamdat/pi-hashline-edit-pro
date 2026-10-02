@@ -1,5 +1,7 @@
 import { NUL_CONTENT_MSG, MAX_BYTES } from "./constants";
 import { HASH_CLASS } from "./hashline/alphabet";
+import { splitWithEndings } from "./line-endings";
+import type { LineEnding } from "./normalize";
 
 export function isRec(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -342,27 +344,74 @@ export function decodeStringArray(value: unknown, warnings?: string[], label = "
 	return undefined;
 }
 
-function splitEditLines(text: string): string[] {
-	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-}
-
-function normalizeLineFieldValue(value: unknown): string[] | undefined {
-	const candidate = typeof value === "string"
-		? value
-		: Array.isArray(value) && value.length === 1 && typeof value[0] === "string"
-			? value[0]
-			: undefined;
-	if (candidate === undefined) return undefined;
-	const decoded = decodeStringArray(candidate);
-	if (decoded !== undefined) return decoded;
-	if (/^\[\s*\]$/.test(stripTrailingMemberCall(stripCodeFence(candidate)))) return [];
-	return splitEditLines(candidate);
+function legacyLinesToText(lines: string[]): string {
+	const decoded = decodeStringArray(lines) ?? lines;
+	const parsedLines: string[] = [];
+	const parsedSeparators: (LineEnding | undefined)[] = [];
+	for (const element of decoded) {
+		const parsed = splitWithEndings(element);
+		const lineCount = element.endsWith("\n") || element.endsWith("\r") ? parsed.lines.length - 1 : parsed.lines.length;
+		for (let index = 0; index < lineCount; index++) {
+			parsedLines.push(parsed.lines[index]!);
+			parsedSeparators.push(parsed.endings[index]);
+		}
+	}
+	let text = "";
+	for (let index = 0; index < parsedLines.length; index++) {
+		const line = parsedLines[index]!;
+		const separator = parsedSeparators[index];
+		text += line;
+		if (separator !== undefined) text += separator;
+		else if (index < parsedLines.length - 1) text += "\n";
+		else if (line === "") text += "\n";
+	}
+	return text;
 }
 
 function normalizeEditLines(record: Record<string, unknown>): void {
 	for (const key of ["replacement_lines", "lines"]) {
-		if (!(key in record)) continue;
-		const lines = normalizeLineFieldValue(record[key]);
-		if (lines !== undefined) record[key] = lines;
+		const value = record[key];
+		if (Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string")) {
+			record[key] = legacyLinesToText(value);
+		}
 	}
+}
+
+const LITERAL_ESCAPE_RE = /\\(?:u([0-9a-fA-F]{4})|([ntr"]))/g;
+
+const REAL_LINE_BREAK_RE = /[\n\r]/;
+
+function isSurrogateEscapePair(line: string, index: number, hex: string): boolean {
+	const code = Number.parseInt(hex, 16);
+	if (code >= 0xd800 && code <= 0xdbff) {
+		const next = /^\\u([0-9a-fA-F]{4})/.exec(line.slice(index + 6))?.[1];
+		if (next === undefined) return false;
+		const nextCode = Number.parseInt(next, 16);
+		return nextCode >= 0xdc00 && nextCode <= 0xdfff;
+	}
+	if (code >= 0xdc00 && code <= 0xdfff) {
+		const previous = /\\u([0-9a-fA-F]{4})$/.exec(line.slice(0, index))?.[1];
+		if (previous === undefined) return false;
+		const previousCode = Number.parseInt(previous, 16);
+		return previousCode >= 0xd800 && previousCode <= 0xdbff;
+	}
+	return false;
+}
+
+export function literalEscapeHint(lines: string[], label: string): string | undefined {
+	for (const line of lines) {
+		if (!line.includes("\\")) continue;
+		const hasRealBreak = REAL_LINE_BREAK_RE.test(line);
+		for (const match of line.matchAll(LITERAL_ESCAPE_RE)) {
+			const hex = match[1];
+			const simple = match[2];
+			if (simple !== undefined && hasRealBreak) continue;
+			if (hex !== undefined) {
+				if (hex.toLowerCase() === "dddd") continue;
+				if (isSurrogateEscapePair(line, match.index, hex)) continue;
+			}
+			return `[H_LITERAL_ESCAPE] "${label}" contains the literal escaped text "${match[0]}"`;
+		}
+	}
+	return undefined;
 }

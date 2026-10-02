@@ -4,6 +4,8 @@ import {
 } from "./hash";
 import { ALPH_RE } from "./alphabet";
 import { NEW_CONTENT_NOT_ARRAY_MSG } from "../constants";
+import { splitWithEndings } from "../line-endings";
+import type { LineEnding } from "../normalize";
 
 const HASH_EXTRACT_RE = new RegExp(HASH_CLASS);
 
@@ -68,15 +70,36 @@ function unwrapJsonEnvelope(line: string): string {
   }
 }
 
+export interface ParsedText {
+	lines: string[];
+	separators: (LineEnding | undefined)[];
+}
+
+export function parseTextWithSeparators(edit: string[]): ParsedText {
+	if (!Array.isArray(edit) || edit.some((line) => typeof line !== "string")) {
+		throw new Error(NEW_CONTENT_NOT_ARRAY_MSG);
+	}
+	const lines: string[] = [];
+	const separators: (LineEnding | undefined)[] = [];
+	for (const element of edit) {
+		const text = unwrapJsonEnvelope(element);
+		const parsed = splitWithEndings(text);
+		const lineCount = text.endsWith("\n") || text.endsWith("\r") ? parsed.lines.length - 1 : parsed.lines.length;
+		for (let index = 0; index < lineCount; index++) {
+			lines.push(parsed.lines[index]!);
+			separators.push(parsed.endings[index]!);
+		}
+	}
+	return { lines, separators };
+}
+
 export function parseText(edit: string[]): string[] {
-  if (!Array.isArray(edit) || edit.some((line) => typeof line !== "string")) {
-    throw new Error(NEW_CONTENT_NOT_ARRAY_MSG);
-  }
-  const out: string[] = [];
-  for (const line of edit) {
-    const unwrapped = unwrapJsonEnvelope(line);
-    const normalized = unwrapped.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    out.push(...normalized.split("\n"));
-  }
-  return out;
+	return parseTextWithSeparators(edit).lines;
+}
+
+export function parsePayloadText(text: string): ParsedText {
+	if (text.length === 0) return { lines: [], separators: [] };
+	const parsed = splitWithEndings(text);
+	const lineCount = text.endsWith("\n") || text.endsWith("\r") ? parsed.lines.length - 1 : parsed.lines.length;
+	return { lines: parsed.lines.slice(0, lineCount), separators: parsed.endings.slice(0, lineCount) };
 }

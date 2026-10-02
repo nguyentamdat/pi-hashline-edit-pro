@@ -15,9 +15,11 @@ import {
   MAX_HASH_LINES,
   type HEdit,
   type PlannedEdit,
+  type StripWarningLocation,
 } from "./hashline";
-import { adoptAnchors, servedForPath } from "./anchor-registry";
-import { restoreEndings, stripBOM, toLF, type LineEnding } from "./normalize";
+import { adoptAnchors, servedForPath, formatAnchorReclaimNotice, takeReclaimedPaths } from "./anchor-registry";
+import { stripBOM, toLF, type LineEnding } from "./normalize";
+import { applySpanEndings, joinSeparators, separatorsForSpans } from "./line-endings";
 import { assertInsertReq, assertReq, normReq } from "./payload-contract";
 import { saveUndo } from "./replace-undo";
 import { buildChanged, buildNoop, type RMetrics, type TResult } from "./replace-response";
@@ -44,6 +46,7 @@ interface BatchBase {
   hashes: string[];
   bom: string;
   ending: LineEnding;
+  separators: LineEnding[];
   identity: FileIdentity;
   hadUtf8DecodeErrors: boolean;
   absolutePath: string;
@@ -64,6 +67,7 @@ export interface BatchPiece {
   noop: boolean;
   foldedLines: number;
   carryIndex?: number;
+  separators?: (LineEnding | undefined)[];
 }
 
 export interface BatchMemberInput {
@@ -77,6 +81,8 @@ export interface BatchMemberInput {
   hedit: HEdit;
   extraWarnings: string[];
   foldedLines?: number;
+  stripWarning?: StripWarningLocation;
+  contentSeparators?: (LineEnding | undefined)[];
 }
 
 interface BatchFailure {
@@ -434,6 +440,7 @@ export async function ensureBatchBase(input: {
     hashes: file.fileHashes.slice(),
     bom: file.bom,
     ending: file.originalEnding,
+    separators: file.endingSeparators,
     identity: file.identity,
     hadUtf8DecodeErrors: file.hadUtf8DecodeErrors,
     absolutePath: file.absolutePath,
@@ -482,6 +489,7 @@ export async function executeBatchMember(input: BatchMemberInput): Promise<TResu
       servedHashes: runtime.served,
       signal: input.signal,
       baseFileLines: base.baseLines,
+      stripWarning: input.stripWarning,
     });
   } catch (error) {
     if (error instanceof RangeStaleError) adoptAnchors(base.absolutePath, error.rangeServedMap);
@@ -497,6 +505,7 @@ export async function executeBatchMember(input: BatchMemberInput): Promise<TResu
   const originalSlice = baseLines.slice(start - 1, end);
   const noop = originalSlice.length === newLines.length && originalSlice.every((line, index) => line === newLines[index]);
   const foldedLines = input.foldedLines ?? 0;
+  const separators = input.contentSeparators ?? input.hedit.content_separators;
   const carryIndex =
     input.kind === "insert" && foldedLines > 0
       ? input.direction === "after"
@@ -513,6 +522,7 @@ export async function executeBatchMember(input: BatchMemberInput): Promise<TResu
     fromHash: input.hedit.hash_bounds[0].hash,
     toHash: input.hedit.hash_bounds[1].hash,
     newLines: [...newLines],
+    ...(separators !== undefined ? { separators } : {}),
     warnings: [...input.extraWarnings, ...planned.warnings],
     noop,
     foldedLines,
@@ -533,11 +543,29 @@ export async function executeBatchMember(input: BatchMemberInput): Promise<TResu
 
 function composeBatchLines(baseContent: string, pieces: BatchPiece[]): string {
   const lines = splitLines(baseContent);
+  const baseLineCount = lines.length;
   const descending = [...pieces].sort((a, b) => b.start - a.start);
   for (const piece of descending) lines.splice(piece.start - 1, piece.end - piece.start + 1, ...piece.newLines);
   let composed = lines.join("\n");
-  if (lines.length > 0 && (baseContent.endsWith("\n") || lines[lines.length - 1] === "")) composed += "\n";
+  if (lines.length > 0 && (baseContent.endsWith("\n") || lines[lines.length - 1] === "")) {
+    composed += "\n";
+  } else if (lines.length > 0) {
+    const trailing = pieces.reduce<BatchPiece | undefined>((best, piece) => (best === undefined || piece.end > best.end ? piece : best), undefined);
+    const lastEnding = trailing?.separators?.[trailing.newLines.length - 1];
+    if (trailing !== undefined && trailing.end === baseLineCount && lastEnding !== undefined) composed += "\n";
+  }
   return composed;
+}
+
+function changesEnding(piece: BatchPiece, baseSeparators: LineEnding[]): boolean {
+  if (piece.separators === undefined) return false;
+  for (let index = 0; index < piece.separators.length; index++) {
+    const ending = piece.separators[index];
+    if (ending === undefined) continue;
+    const baseIndex = piece.start - 1 + index;
+    if (baseIndex >= baseSeparators.length || baseSeparators[baseIndex] !== ending) return true;
+  }
+  return false;
 }
 
 function mergeInsertPairs(pieces: BatchPiece[]): BatchPiece[] {
@@ -569,12 +597,16 @@ function mergeInsertPairs(pieces: BatchPiece[]): BatchPiece[] {
     consumed.add(partner);
     const before = piece.direction === "before" ? piece : partner;
     const after = piece.direction === "before" ? partner : piece;
+    const beforeSeparators = before.separators ?? before.newLines.map(() => undefined);
+    const afterSeparators = after.separators ?? after.newLines.map(() => undefined);
+    const mergedSeparators = [...beforeSeparators.slice(0, before.newLines.length), ...afterSeparators.slice(1)];
     merged.push({
       ...before,
       order: Math.min(before.order, after.order),
       newLines: [...before.newLines, ...after.newLines.slice(1)],
       warnings: [...before.warnings, ...after.warnings],
       foldedLines: before.foldedLines + after.foldedLines - 1,
+      ...(before.separators !== undefined || after.separators !== undefined ? { separators: mergedSeparators } : {}),
     });
   }
   return merged;
@@ -610,11 +642,12 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     }
   }
   const appliedPieces = runtime.pieces.filter((piece) => !piece.noop);
-  if (appliedPieces.length === 0) {
+  const candidatePieces = runtime.pieces.filter((piece) => !piece.noop || changesEnding(piece, base.separators));
+  if (candidatePieces.length === 0) {
     const snapshotId = await safeSnapId(paths.absolutePath, "noop edit");
     return combinedNoop(paths.displayPath, member, runtime, snapshotId);
   }
-  const effectivePieces = mergeInsertPairs(appliedPieces);
+  const effectivePieces = mergeInsertPairs(candidatePieces);
   const ordered = [...effectivePieces].sort((a, b) => a.start - b.start);
   for (let i = 1; i < ordered.length; i++) {
     const prev = ordered[i - 1]!;
@@ -625,20 +658,31 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     }
   }
   const composed = composeBatchLines(base.content, effectivePieces);
+  const spans = pieceMappingSpans(effectivePieces);
+  const resultSeparators = separatorsForSpans(base.separators, base.hashes.length, spans, composed, base.ending);
+  applySpanEndings(resultSeparators, effectivePieces.map((piece) => ({
+    start: piece.start - 1,
+    end: piece.end - 1,
+    replacementCount: piece.newLines.length,
+    ...(piece.separators !== undefined ? { endings: piece.separators } : {}),
+  })));
   const warnings = [...runtime.warnings];
   if (base.hadUtf8DecodeErrors) warnings.push("Non-UTF-8 bytes were shown as U+FFFD; this edit rewrote the file as UTF-8.");
+  const finalBytes = base.bom + joinSeparators(composed, resultSeparators);
+  const originalBytes = base.bom + joinSeparators(base.content, base.separators);
   try {
     await throwIfStrictInput(dedupeWarnings(warnings));
     assertNotEmpty(base.content, composed);
     assertLineLimit(composed, paths.displayPath, MAX_HASH_LINES);
-    const finalBytes = base.bom + restoreEndings(composed, base.ending);
     assertByteLimit(finalBytes, paths.displayPath);
   } catch (error) {
     discardBatchState(runtime);
     if (error instanceof Error) error.message = withAbortSuffix(error.message, runtime.display);
     throw error;
   }
-  if (composed === base.content) {
+  const reclaimNotice = formatAnchorReclaimNotice(takeReclaimedPaths());
+  if (reclaimNotice !== undefined) warnings.push(reclaimNotice);
+  if (finalBytes === originalBytes) {
     const snapshotId = await safeSnapId(paths.absolutePath, "noop edit");
     return combinedNoop(paths.displayPath, member, runtime, snapshotId);
   }
@@ -655,12 +699,11 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     discardBatchState(runtime);
     throw new Error(`[E_OP_ABORTED] Batch ${runtime.display} aborted: the file changed after the batch started. Call read for fresh anchors and retry.`);
   }
-  const preflightSpans = pieceMappingSpans(effectivePieces);
   try {
     await lineHashes(composed, runtime.target, {
       content: base.content,
       hashes: base.hashes,
-      spans: preflightSpans,
+      spans,
     }, undefined, false, true);
   } catch (error) {
     discardBatchState(runtime);
@@ -671,8 +714,10 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     content: base.content,
     bom: base.bom,
     originalEnding: base.ending,
+    separators: base.separators,
     hashes: base.hashes,
     resultContent: composed,
+    resultSeparators,
   });
   if (!undo.persisted) {
     discardBatchState(runtime);
@@ -680,7 +725,7 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
   }
   try {
     abortIf(signal);
-    await writeAtomic(paths.absolutePath, base.bom + restoreEndings(composed, base.ending), base.identity);
+    await writeAtomic(paths.absolutePath, base.bom + joinSeparators(composed, resultSeparators), base.identity);
   } catch (error) {
     await undo.restore();
     discardBatchState(runtime);
@@ -688,7 +733,6 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     throw error;
   }
   const updatedSnapshotId = await safeSnapId(paths.absolutePath, "post-edit");
-  const spans = pieceMappingSpans(effectivePieces);
   let resultHashes: string[];
   try {
     resultHashes = await lineHashes(composed, runtime.target, {
@@ -700,6 +744,8 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${detail} File was written; anchor finalization failed. One undo reverts. Call read for fresh anchors.`);
   }
+  const writeReclaim = formatAnchorReclaimNotice(takeReclaimedPaths());
+  if (writeReclaim !== undefined) warnings.push(writeReclaim);
   const range = changedRange(base.content, composed);
   let added = 0;
   let removed = 0;
@@ -730,8 +776,10 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
     batchVerb(runtime),
     await getDiffContextLines(),
   );
-  changed.details.diff = `${header}\n${changed.details.diff}`;
-  changed.details.diffLineNumbers?.unshift(null);
+  if (changed.details.diff.length > 0) {
+    changed.details.diff = `${header}\n${changed.details.diff}`;
+    changed.details.diffLineNumbers?.unshift(null);
+  }
   try {
     serveRows(runtime.target, resultHashes, splitLines(composed), servedHashesFromDiff(changed.details.diff));
   } catch (error) {
@@ -746,6 +794,8 @@ async function finishBatch(member: PlannedMember, signal?: AbortSignal): Promise
 async function combinedNoop(path: string, member: PlannedMember, runtime: BatchState, snapshotId: string | undefined): Promise<TResult> {
   const executed = runtime.applied + runtime.noops;
   const warnings = [...runtime.warnings];
+  const reclaimNotice = formatAnchorReclaimNotice(takeReclaimedPaths());
+  if (reclaimNotice !== undefined) warnings.push(reclaimNotice);
   const noop = buildNoop(
     {
       path,

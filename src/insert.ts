@@ -1,42 +1,38 @@
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { constants } from "node:fs";
-import { execPipeline, type ReqParams, type ReplaceDetails, previewFromPipe, previewError } from "./replace";
+import { execPipeline, type ReplaceDetails, previewFromPipe, previewError } from "./replace";
 import { commitEdit } from "./commit";
 import { batchMemberFor, ensureBatchBase, executeBatchMember, noteBatchFailure } from "./batch";
 import { readNormFile, type NormFile } from "./file-reader";
-import { MAX_HASH_LINES, parseHashRef, resEdit, resolveAnchorLine, type Anchor, type HEdit } from "./hashline";
+import { MAX_HASH_LINES, parseHashRef, parsePayloadText, resEdit, resolveAnchorLine, type Anchor, type HEdit, type HTEdit, type StripWarningLocation } from "./hashline";
+import type { LineEnding } from "./normalize";
 import { stripAnchorRow } from "./hashline/resolve";
 import { withAnchorSession } from "./anchor-registry";
 import { loadP, loadGuide } from "./prompts";
 import { assertInsertReq, normReq, type InsertReq } from "./payload-contract";
-import { decodeStringArray, isRec, splitLines } from "./utils";
+import { isRec, literalEscapeHint, splitLines } from "./utils";
 import { queuedEdit, editToolBase, editRenderCallWrapper, editRenderResultWrapper, resolveEditTargetWithRequirement, throwIfStrictInput, withInsertPrompts, DEFAULT_EDIT_FLAGS, type EditToolFlags } from "./edit-common";
 import type { RPreview, RRState } from "./replace-render";
 export { assertInsertReq, type InsertReq };
 
 const insertAnchorSchema = Type.String({
   description:
-    'Bare 4-char anchor from a served anchor│content row (the text before the `│` separator), never the row content. A pasted diff row or `anchor│` prefix is stripped with a warning. The anchor line is preserved; lines go after or before it.',
+    "4-char anchor of the line to insert next to (never the row content). A pasted diff row is stripped with a warning; the anchor line is preserved.",
 });
 
 const insertDirectionSchema = Type.Union(
   [Type.Literal("after"), Type.Literal("before")],
   { description: '"after" or "before"' },
 );
-
-const insertLinesSchema = Type.Array(
-  Type.String({
-    description: "One line to insert; never embed \\n inside an element.",
-  }),
-  {
-    description: 'One string per line; [""] is a blank line; never include the anchor line.',
-  }
-);
+const insertLinesSchema = Type.String({
+  description:
+    'The exact text to insert. "" inserts nothing, "\\n" is one blank line, and a trailing line break sets the last line\'s ending instead of adding a blank line. Never include the anchor line.',
+});
 
 const insertPathRequiredSchema = Type.String({
   description:
-    "Path to the file the anchor was served for; required and must match anchor ownership. The anchor still resolves the target.",
+    "Path to the file the anchor was served for; required and must match anchor ownership.",
 });
 
 const insertToolSchema = Type.Object(
@@ -73,35 +69,40 @@ export function buildInsertEdit(
   preload: NormFile,
   ref: Anchor,
   path: string,
-): { editParams: ReqParams; anchorLine: string | undefined } {
+): { editParams: HTEdit; anchorLine: string | undefined; contentSeparators: (LineEnding | undefined)[] } {
+  const parsed = parsePayloadText(req.lines);
   const fileLines = splitLines(preload.normalized);
   const line = resolveAnchorLine(ref, fileLines, preload.fileHashes, path);
   const anchorLine = preload.normalized.length === 0 ? undefined : fileLines[line - 1];
-  const editParams: ReqParams = {
+  const editParams: HTEdit = {
     remove_from: ref.hash,
     remove_to: ref.hash,
     replacement_lines:
       anchorLine === undefined
-        ? [...req.lines]
+        ? [...parsed.lines]
         : req.direction === "after"
-          ? [anchorLine, ...req.lines]
-          : [...req.lines, anchorLine],
+          ? [anchorLine, ...parsed.lines]
+          : [...parsed.lines, anchorLine],
   };
-  return { editParams, anchorLine };
+  const contentSeparators = anchorLine === undefined
+    ? parsed.separators
+    : req.direction === "after"
+      ? [undefined, ...parsed.separators]
+      : [...parsed.separators, undefined];
+  return { editParams, anchorLine, contentSeparators };
+}
+
+function insertStripWarning(anchorLine: string | undefined, direction: "before" | "after"): StripWarningLocation {
+  return { label: "lines", indexOffset: anchorLine !== undefined && direction === "after" ? -1 : 0 };
 }
 
 export async function insertPreview(request: unknown, cwd: string, signal?: AbortSignal): Promise<RPreview> {
   try {
     const normalized = normReq(request);
-    const previewFixes: string[] = [];
-    if (isRec(normalized)) {
-      const expanded = decodeStringArray(normalized.lines, previewFixes, "lines");
-      if (expanded) normalized.lines = expanded;
-    }
     assertInsertReq(normalized);
     const previewReq = normalized as InsertReq;
     const { ref, warnings: previewAnchorWarnings } = parseInsertAnchor(previewReq.anchor);
-    await throwIfStrictInput([...previewFixes, ...previewAnchorWarnings]);
+    await throwIfStrictInput(previewAnchorWarnings);
     const targetPath = await resolveEditTargetWithRequirement({
       anchor: previewReq.anchor,
       providedPath: previewReq.path,
@@ -114,12 +115,14 @@ export async function insertPreview(request: unknown, cwd: string, signal?: Abor
       allocation: "shadow",
       signal,
     });
-    const { editParams } = buildInsertEdit(normalized, preload, ref, targetPath);
+    const { editParams, anchorLine, contentSeparators } = buildInsertEdit(normalized, preload, ref, targetPath);
     const pipe = await execPipeline(targetPath, editParams, cwd, {
       accessMode: constants.R_OK,
       noPersist: true,
       preloadedNorm: preload,
       signal,
+      stripWarning: insertStripWarning(anchorLine, normalized.direction),
+      endingOverrides: contentSeparators,
     });
     return previewFromPipe(pipe);
   } catch (error: unknown) {
@@ -128,7 +131,7 @@ export async function insertPreview(request: unknown, cwd: string, signal?: Abor
   }
 }
 
-function getInsertInput(args: unknown): { path?: string; anchor?: string; direction?: "before" | "after"; lines?: string[] } | null {
+function getInsertInput(args: unknown): { path?: string; anchor?: string; direction?: "before" | "after"; lines?: string } | null {
   let normalized: unknown;
   try {
     normalized = normReq(args);
@@ -139,8 +142,7 @@ function getInsertInput(args: unknown): { path?: string; anchor?: string; direct
   if (
     typeof normalized.anchor !== "string" ||
     (normalized.direction !== "before" && normalized.direction !== "after") ||
-    !Array.isArray(normalized.lines) ||
-    normalized.lines.some((line) => typeof line !== "string")
+    typeof normalized.lines !== "string"
   ) {
     return null;
   }
@@ -148,7 +150,7 @@ function getInsertInput(args: unknown): { path?: string; anchor?: string; direct
     ...(typeof normalized.path === "string" ? { path: normalized.path } : {}),
     anchor: normalized.anchor as string,
     direction: normalized.direction as "before" | "after",
-    lines: normalized.lines as string[],
+    lines: normalized.lines,
   };
 }
 
@@ -173,13 +175,11 @@ export function buildInsertToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): I
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       return withAnchorSession(ctx, async () => {
         const canonical = normReq(params);
-        const insertWarnings: string[] = [];
-        if (isRec(canonical)) {
-          const expanded = decodeStringArray(canonical.lines, insertWarnings, "lines");
-          if (expanded) canonical.lines = expanded;
-        }
         assertInsertReq(canonical);
         const req = canonical;
+        const insertWarnings: string[] = [];
+        const literalEscape = literalEscapeHint([req.lines], "lines");
+        if (literalEscape !== undefined) insertWarnings.push(literalEscape);
         const targetPath = await resolveEditTargetWithRequirement({
           anchor: req.anchor,
           providedPath: req.path,
@@ -224,6 +224,8 @@ export function buildInsertToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): I
               hedit,
               extraWarnings: [...anchorWarnings, ...insertWarnings, ...resWarnings],
               foldedLines: built.anchorLine === undefined ? 0 : 1,
+              stripWarning: insertStripWarning(built.anchorLine, req.direction),
+              contentSeparators: built.contentSeparators,
             });
           }
           const preload = await readNormFile(targetPath, ctx.cwd, {
@@ -231,11 +233,13 @@ export function buildInsertToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): I
             accessMode: constants.R_OK | constants.W_OK,
             maxLines: MAX_HASH_LINES,
           });
-          const { editParams, anchorLine } = buildInsertEdit(req, preload, ref, targetPath);
+          const { editParams, anchorLine, contentSeparators } = buildInsertEdit(req, preload, ref, targetPath);
           const pipe = await execPipeline(targetPath, editParams, ctx.cwd, {
             accessMode: constants.R_OK | constants.W_OK,
             signal,
             preloadedNorm: preload,
+            stripWarning: insertStripWarning(anchorLine, req.direction),
+            endingOverrides: contentSeparators,
           });
           return commitEdit(pipe, {
             path: pipe.path,
@@ -250,6 +254,7 @@ export function buildInsertToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): I
             noopNoun: "Insertion",
             foldedAnchorLines: anchorLine === undefined ? 0 : 1,
             prefixWarnings: [...anchorWarnings, ...insertWarnings],
+            endingOverrides: contentSeparators,
           });
         });
       });

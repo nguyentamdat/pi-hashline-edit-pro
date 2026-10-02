@@ -7,6 +7,7 @@ import {
 	fmtResult,
 	fmtCall,
 	getResultText,
+	extractHints,
 	extractWarnings,
 	isApplied,
 	buildAppliedText,
@@ -30,7 +31,7 @@ describe("getPreviewInput", () => {
 	});
 
   it("returns partial input for record without path", () => {
-    expect(getPreviewInput({ remove_from: "ATIm", remove_to: "BeSR", replacement_lines: ["new"] })).toEqual({ remove_from: "ATIm", remove_to: "BeSR", replacement_lines: ["new"] });
+    expect(getPreviewInput({ remove_from: "ATIm", remove_to: "BeSR", replacement_lines: "new" })).toEqual({ remove_from: "ATIm", remove_to: "BeSR", replacement_lines: "new" });
   });
 
 	it("returns null for record with non-string path", () => {
@@ -42,7 +43,7 @@ describe("getPreviewInput", () => {
 	});
 
 	it("returns request for valid input", () => {
-		const input = { remove_from: "ATIm", remove_to: "BeSR", replacement_lines: ["new"] };
+		const input = { remove_from: "ATIm", remove_to: "BeSR", replacement_lines: "new" };
 		const result = getPreviewInput(input);
 		expect(result).toEqual(input);
 	});
@@ -190,6 +191,12 @@ describe("extractWarnings", () => {
 
 	it("returns undefined for undefined input", () => {
 		expect(extractWarnings(undefined)).toBeUndefined();
+	});
+
+	it("extracts hints and keeps warnings separate from them", () => {
+		const text = "Some text\nWarnings:\nWarning 1\n\nHints:\nHint 1";
+		expect(extractWarnings(text)).toBe("Warnings:\nWarning 1");
+		expect(extractHints(text)).toBe("Hints:\nHint 1");
 	});
 });
 

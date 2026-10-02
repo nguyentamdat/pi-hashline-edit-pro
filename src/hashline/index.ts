@@ -18,13 +18,17 @@ export {
 export {
 	parseHashRef,
 	parseText,
+	parseTextWithSeparators,
+	parsePayloadText,
 	type Anchor,
+	type ParsedText,
 } from "./parse";
 
 export {
 	type HEdit,
 	type RHEdit,
 	type HTEdit,
+	type HTPayloadEdit,
 	type NEdit,
 	resEdit,
 	stripAnchorRow,
@@ -32,6 +36,7 @@ export {
 	valEdit,
 	stripBarePrefixes,
 	stripDiffPrefixes,
+	type StripWarningLocation,
 	swapReversedRanges,
 	assertRangeServed,
 	RangeStaleError,

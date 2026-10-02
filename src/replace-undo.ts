@@ -6,9 +6,10 @@ import { Type } from "typebox";
 import { loadHashStore, persistSnapshot, upsertUndo, getUndoEntry, deleteUndo, type UndoRecord } from "./hash-store";
 import { servedHashesFromDiff, serveRows } from "./served";
 import { lineChecksum } from "./hashline";
-import { freeAnchors, adoptAnchors, withAnchorSession } from "./anchor-registry";
+import { freeAnchors, adoptAnchors, withAnchorSession, formatAnchorReclaimNotice, takeReclaimedPaths } from "./anchor-registry";
 import { resolveInCwd, writeAtomic, type FileIdentity } from "./fs-write";
 import { toLF, stripBOM, restoreEndings, type LineEnding } from "./normalize";
+import { joinSeparators } from "./line-endings";
 import { genDiff, genPatch, spansFromHashes } from "./replace-diff";
 import { getDiffContextLines } from "./config";
 import { cntDiff, errCode, makePrepareArguments, splitLines } from "./utils";
@@ -22,8 +23,10 @@ export interface UndoEntry {
   content: string;
   bom: string;
   originalEnding: LineEnding;
+  separators?: LineEnding[];
   hashes: string[];
   resultContent: string;
+  resultSeparators?: LineEnding[];
   mode?: number;
 }
 
@@ -44,8 +47,10 @@ export async function saveUndo(
       content: entry.content,
       bom: entry.bom,
       ending: entry.originalEnding,
+      ...(entry.separators !== undefined ? { separators: entry.separators } : {}),
       hashes: entry.hashes,
       resultContent: entry.resultContent,
+      ...(entry.resultSeparators !== undefined ? { resultSeparators: entry.resultSeparators } : {}),
       ...(mode !== undefined ? { mode } : {}),
     });
   } catch (error) {
@@ -80,8 +85,10 @@ export async function getUndo(path: string): Promise<UndoEntry | undefined> {
       content: record.content,
       bom: record.bom,
       originalEnding,
+      ...(record.separators !== undefined ? { separators: record.separators as LineEnding[] } : {}),
       hashes: record.hashes,
       resultContent: record.resultContent,
+      ...(record.resultSeparators !== undefined ? { resultSeparators: record.resultSeparators as LineEnding[] } : {}),
       ...(record.mode !== undefined ? { mode: record.mode } : {}),
     };
   } catch (error) {
@@ -171,7 +178,7 @@ export function regUndo(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
 
           if (
             currentRaw !== undefined &&
-            currentRaw !== undo.bom + restoreEndings(undo.resultContent, undo.originalEnding)
+            currentRaw !== undo.bom + (undo.resultSeparators !== undefined ? joinSeparators(undo.resultContent, undo.resultSeparators) : restoreEndings(undo.resultContent, undo.originalEnding))
           ) {
             return {
               content: [
@@ -187,7 +194,7 @@ export function regUndo(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
 
           await writeAtomic(
             mutationTargetPath,
-            undo.bom + restoreEndings(undo.content, undo.originalEnding),
+            undo.bom + (undo.separators !== undefined ? joinSeparators(undo.content, undo.separators) : restoreEndings(undo.content, undo.originalEnding)),
             currentIdentity,
             undo.mode ?? fallbackFileMode(),
           );
@@ -237,6 +244,8 @@ export function regUndo(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
           parts.push(
             "Call read for fresh anchors.",
           );
+          const reclaimNotice = formatAnchorReclaimNotice(takeReclaimedPaths());
+          if (reclaimNotice !== undefined) parts.push(reclaimNotice);
 
           const patchResult = genPatch(path, currentNormalized, undo.content);
           return {
@@ -255,7 +264,7 @@ export function regUndo(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
                 classification: "applied",
                 editsAttempted: 1,
                 noopEditsCount: 0,
-                warningsCount: 0,
+                warningsCount: reclaimNotice !== undefined ? 1 : 0,
                 firstChangedLine: restoredRange?.firstChangedLine,
                 lastChangedLine: restoredRange?.lastChangedLine,
                 addedLines: linesRemovedByReplace,

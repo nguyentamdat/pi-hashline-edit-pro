@@ -214,7 +214,7 @@ describe("insert tool", () => {
 
   it("rejects a NUL byte in lines before any file I/O", () => {
     const nul = String.fromCharCode(0);
-    expect(() => assertInsertReq({ anchor: "Hasu", direction: "after", lines: [nul] })).toThrow(/NUL byte/);
+    expect(() => assertInsertReq({ anchor: "Hasu", direction: "after", lines: nul })).toThrow(/NUL byte/);
   });
 
   it("rejects a NUL byte in inserted lines", async () => {
@@ -228,7 +228,7 @@ describe("insert tool", () => {
       await expect(
         insertTool.execute(
           "i1",
-          { anchor: betaHash, direction: "after", lines: [`a${nul}b`] },
+          { anchor: betaHash, direction: "after", lines: `a${nul}b` },
           undefined, undefined, ctx,
         ),
       ).rejects.toThrow(/NUL byte/);
@@ -359,7 +359,7 @@ describe("insert tool", () => {
 
       const result = await insertTool.execute(
         "i1",
-        { anchor: betaHash, direction: "after", lines: '["beta1", "beta2"].map(s => s)' },
+        { anchor: betaHash, direction: "after", lines: ['["beta1", "beta2"].map(s => s)'] },
         undefined, undefined, ctx,
       );
 
@@ -383,6 +383,74 @@ describe("insert tool", () => {
     await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd }) => {
       const preview = await insertPreview({ anchor: "!!!!", direction: "after", lines: ["x"] }, cwd);
       expect(preview).toHaveProperty("error");
+    });
+  });
+});
+
+describe("insert strip warnings", () => {
+  it("reports a stripped line with the caller's index for direction after", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const text = getText(await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx));
+      const betaHash = extractHash(text.split("\n").find((line) => line.includes("│beta"))!);
+      const result = await getTool("insert").execute(
+        "i1",
+        { anchor: betaHash, direction: "after", lines: [`+${betaHash}│beta1`, "beta2"] },
+        undefined, undefined, ctx,
+      );
+      expect(result.content[0].text).toContain("Stripped diff-preview marker from lines line 1.");
+      expect(result.content[0].text).not.toContain("replacement_lines");
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\nbeta1\nbeta2\ngamma\n");
+    });
+  });
+
+  it("reports a stripped line with the caller's index for direction before", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const text = getText(await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx));
+      const betaHash = extractHash(text.split("\n").find((line) => line.includes("│beta"))!);
+      const result = await getTool("insert").execute(
+        "i1",
+        { anchor: betaHash, direction: "before", lines: ["beta1", `+${betaHash}│beta2`] },
+        undefined, undefined, ctx,
+      );
+      expect(result.content[0].text).toContain("Stripped diff-preview marker from lines line 2.");
+      expect(result.content[0].text).not.toContain("replacement_lines");
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta1\nbeta2\nbeta\ngamma\n");
+    });
+  });
+
+  it("lists every stripped line in the caller's numbering", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const text = getText(await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx));
+      const betaHash = extractHash(text.split("\n").find((line) => line.includes("│beta"))!);
+      const result = await getTool("insert").execute(
+        "i1",
+        { anchor: betaHash, direction: "after", lines: ["abcd│one", `+${betaHash}│two`, "three"] },
+        undefined, undefined, ctx,
+      );
+      expect(result.content[0].text).toContain('Stripped "anchor│" prefix from lines line 1.');
+      expect(result.content[0].text).toContain("Stripped diff-preview marker from lines line 2.");
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\none\ntwo\nthree\ngamma\n");
+    });
+  });
+});
+
+describe("insert literal escape hints", () => {
+  it("hints and writes the literal escaped text", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const text = getText(await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx));
+      const betaHash = extractHash(text.split("\n").find((line) => line.includes("│beta"))!);
+      const result = await getTool("insert").execute(
+        "i1",
+        { anchor: betaHash, direction: "after", lines: [String.raw`stable\u200bCheckout`] },
+        undefined, undefined, ctx,
+      );
+      expect(result.content[0].text).toContain(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\u200b"`);
+      expect(result.details.hints).toEqual([String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\u200b"`]);
+      expect(await readFile(path, "utf-8")).toBe("alpha\nbeta\nstable\\u200bCheckout\n");
     });
   });
 });
@@ -454,6 +522,18 @@ describe("insert tool rendering", () => {
       ]);
       expect(state.preview).toHaveProperty("diff");
       expect((state.preview as { diff: string }).diff).toContain("BETA1");
+    });
+  });
+});
+
+describe("provided line endings", () => {
+  it("writes a CRLF separator embedded in lines", async () => {
+    await withTempFile("sample.ts", "alpha\nbeta\n", async ({ cwd, path }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const text = getText(await readTool.execute("r1", { path: "sample.ts" }, undefined, undefined, ctx));
+      const alphaHash = extractHash(text.split("\n").find((line) => line.includes("│alpha"))!);
+      await getTool("insert").execute("i1", { anchor: alphaHash, direction: "after", lines: ["I1\r\nI2"] }, undefined, undefined, ctx);
+      expect(await readFile(path, "utf-8")).toBe("alpha\nI1\r\nI2\nbeta\n");
     });
   });
 });

@@ -3,6 +3,8 @@ import {
   toggleAutoRead,
   cycleAutoReadAllMode,
   toggleAnchorGrep,
+  toggleCopyMove,
+  toggleReplaceWithin,
   toggleRequirePath,
   toggleStrictInput,
   adjustDiffContextLines,
@@ -73,6 +75,58 @@ describe("config - toggleAnchorGrep", () => {
       const config = await readConfig();
       expect(config.autoRead).toBe(false);
       expect(config.anchorGrepEnabled).toBe(false);
+    });
+  });
+});
+
+describe("config - toggleCopyMove", () => {
+  it("toggles from default true to false", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect(await toggleCopyMove()).toBe(false);
+      expect((await readConfig()).copyMoveEnabled).toBe(false);
+    });
+  });
+
+  it("toggles from false back to true", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      await writeConfig({ autoRead: true, anchorGrepEnabled: true, copyMoveEnabled: false });
+      expect(await toggleCopyMove()).toBe(true);
+      expect((await readConfig()).copyMoveEnabled).toBe(true);
+    });
+  });
+
+  it("round-trips correctly through multiple toggles", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect(await toggleCopyMove()).toBe(false);
+      expect(await toggleCopyMove()).toBe(true);
+      expect(await toggleCopyMove()).toBe(false);
+      expect((await readConfig()).copyMoveEnabled).toBe(false);
+    });
+  });
+});
+
+describe("config - toggleReplaceWithin", () => {
+  it("toggles from default true to false", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect(await toggleReplaceWithin()).toBe(false);
+      expect((await readConfig()).replaceWithinEnabled).toBe(false);
+    });
+  });
+
+  it("toggles from false back to true", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      await writeConfig({ autoRead: true, anchorGrepEnabled: true, replaceWithinEnabled: false });
+      expect(await toggleReplaceWithin()).toBe(true);
+      expect((await readConfig()).replaceWithinEnabled).toBe(true);
+    });
+  });
+
+  it("round-trips correctly through multiple toggles", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect(await toggleReplaceWithin()).toBe(false);
+      expect(await toggleReplaceWithin()).toBe(true);
+      expect(await toggleReplaceWithin()).toBe(false);
+      expect((await readConfig()).replaceWithinEnabled).toBe(false);
     });
   });
 });
@@ -189,6 +243,18 @@ describe("config - readConfig defaults", () => {
   it("defaults to true when no config file exists", async () => {
     await withTempDir("pi-hashline-config-test-", async () => {
       expect((await readConfig()).autoRead).toBe(true);
+    });
+  });
+
+  it("defaults copyMoveEnabled to true when no config file exists", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect((await readConfig()).copyMoveEnabled).toBe(true);
+    });
+  });
+
+  it("defaults replaceWithinEnabled to true when no config file exists", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect((await readConfig()).replaceWithinEnabled).toBe(true);
     });
   });
 

@@ -2,6 +2,7 @@ import type { NEdit } from "./hashline";
 import type { ReplaceDetails } from "./replace";
 import { genDiff, genPatch, type DiffSpan } from "./replace-diff";
 import { visLines, clipLine } from "./utils";
+import { fidelityHints } from "./edit-fidelity";
 
 export type TResult = {
 	content: Array<{ type: "text"; text: string }>;
@@ -85,6 +86,17 @@ function warnBlock(warnings: string[] | undefined): string {
 	return warnings?.length ? `\n\nWarnings:\n${warnings.join("\n")}` : "";
 }
 
+function hintBlock(hints: string[] | undefined): string {
+	return hints?.length ? `\n\nHints:\n${hints.join("\n")}` : "";
+}
+
+function splitNotices(notices: string[] | undefined): { warnings: string[]; hints: string[] } {
+	const warnings: string[] = [];
+	const hints: string[] = [];
+	for (const notice of notices ?? []) (notice.startsWith("[H_") ? hints : warnings).push(notice);
+	return { warnings, hints };
+}
+
 export function buildNoop(input: NoopInput, noopNoun = "Replacement"): TResult {
 	const {
 		path,
@@ -97,13 +109,14 @@ export function buildNoop(input: NoopInput, noopNoun = "Replacement"): TResult {
 	const noopDetailsText = noopEdit
 		? `${noopNoun} for ${noopEdit.loc} is identical to current content:\n  ${noopEdit.loc}: ${clipLine(noopEdit.currentContent)}`
 		: "The edit produced identical content.";
-	const text = `No changes made to ${path}\nClassification: noop\n${noopDetailsText}${warnBlock(warnings)}`;
+	const { warnings: noticeWarnings, hints } = splitNotices(warnings);
+	const text = `No changes made to ${path}\nClassification: noop\n${noopDetailsText}${warnBlock(noticeWarnings)}${hintBlock(hints)}`;
 
 	const metrics = buildMetrics({
 		classification: "noop",
 		editsAttempted: editMeta.editsAttempted,
 		noopEditsCount: editMeta.noopEditsCount,
-		warningsCount: warnings?.length ?? 0,
+		warningsCount: noticeWarnings.length,
 	});
 
 	return {
@@ -115,7 +128,8 @@ export function buildNoop(input: NoopInput, noopNoun = "Replacement"): TResult {
 			snapshotId,
 			classification: "noop" as const,
       metrics,
-      ...(warnings?.length ? { warnings: [...warnings] } : {}),
+      ...(noticeWarnings.length ? { warnings: [...noticeWarnings] } : {}),
+      ...(hints.length ? { hints: [...hints] } : {}),
 		},
 	};
 }
@@ -126,22 +140,24 @@ export function buildChanged(input: SuccessInput, verb = "replaced", diffContext
   const diffResult = genDiff(originalNormalized, result, diffContextLines, resultHashes, originalHashes, undefined, spans);
   const addedLines = editMeta.addedLines;
   const removedLines = editMeta.removedLines;
-  const warningsBlock = warnBlock(warnings);
+  const fidelity = fidelityHints(originalNormalized, result, spans);
+  const { warnings: noticeWarnings, hints } = splitNotices(fidelity.length > 0 ? [...(warnings ?? []), ...fidelity] : warnings);
+  const noticesBlock = `${warnBlock(noticeWarnings)}${hintBlock(hints)}`;
   const successPrefix = `Successfully ${verb} in ${path}.`;
   const lineSummary = addedLines > 0 || removedLines > 0
     ? ` Added ${addedLines} line(s), removed ${removedLines} line(s).`
     : "";
   const text = resultLines.length === 0
     ? "File is empty. Use replace to insert content."
-    : warningsBlock
-      ? `${successPrefix}${lineSummary}${warningsBlock}`
+    : noticesBlock
+      ? `${successPrefix}${lineSummary}${noticesBlock}`
       : `${successPrefix}${lineSummary}`;
 
   const metrics = buildMetrics({
     classification: "applied",
     editsAttempted: editMeta.editsAttempted,
     noopEditsCount: editMeta.noopEditsCount,
-    warningsCount: warnings?.length ?? 0,
+    warningsCount: noticeWarnings.length,
     firstChangedLine: editMeta.firstChangedLine,
     lastChangedLine: editMeta.lastChangedLine,
     addedLines,
@@ -160,7 +176,8 @@ export function buildChanged(input: SuccessInput, verb = "replaced", diffContext
       snapshotId,
       metrics,
       diffLineNumbers: diffResult.lineNumbers.map((line) => line ?? null),
-      ...(warnings?.length ? { warnings: [...warnings] } : {}),
+      ...(noticeWarnings.length ? { warnings: [...noticeWarnings] } : {}),
+      ...(hints.length ? { hints: [...hints] } : {}),
     },
   };
 }

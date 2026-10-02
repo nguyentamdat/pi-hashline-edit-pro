@@ -889,7 +889,7 @@ describe("same-turn edit batches", () => {
       const betaRef = anchorFor(text, "beta");
       const gammaRef = anchorFor(text, "gamma");
 
-      const firstArgs = { remove_from: betaRef, remove_to: betaRef, replacement_lines: '["BETA"].map(s => s)' };
+      const firstArgs = { remove_from: betaRef, remove_to: betaRef, replacement_lines: ['["BETA"].map(s => s)'] };
       const secondArgs = { remove_from: gammaRef, remove_to: gammaRef, replacement_lines: ["GAMMA"] };
       const message = assistantMessage([
         toolCall("m1", "replace", firstArgs),
@@ -1094,6 +1094,52 @@ describe("same-turn edit batches", () => {
         { type: "turn_end", turnIndex: 0, message, toolResults: [{ toolCallId: "s1" }, { toolCallId: "s2" }] },
         ctx,
       ) as Promise<unknown>);
+    });
+  });
+});
+
+describe("batched insert strip warnings", () => {
+  it("reports the lines field with the caller's index", async () => {
+    await withTempFile("sample.txt", "one\ntwo\nthree\n", async ({ cwd, path }) => {
+      const { getTool, handlers, ctx } = await setupBatchTools(cwd);
+      const readTool = getTool("read");
+      const insertTool = getTool("insert");
+      const text = (await readTool.execute("r1", { path: "sample.txt" }, undefined, undefined, ctx)).content[0].text as string;
+      const oneRef = anchorFor(text, "one");
+      const threeRef = anchorFor(text, "three");
+      const firstArgs = { anchor: oneRef, direction: "after", lines: [`+${oneRef}│ONE-A`] };
+      const secondArgs = { anchor: threeRef, direction: "after", lines: ["THREE-A"] };
+      const message = assistantMessage([
+        toolCall("i1", "insert", firstArgs),
+        toolCall("i2", "insert", secondArgs),
+      ]);
+      await (handlers.get("message_end")!({ type: "message_end", message }, ctx) as Promise<unknown>);
+      await insertTool.execute("i1", firstArgs, undefined, undefined, ctx);
+      const last = await insertTool.execute("i2", secondArgs, undefined, undefined, ctx);
+      expect(last.content[0].text).toContain("Stripped diff-preview marker from lines line 1.");
+      expect(last.content[0].text).not.toContain("replacement_lines");
+      expect(await readFile(path, "utf-8")).toBe("one\nONE-A\ntwo\nthree\nTHREE-A\n");
+    });
+  });
+});
+
+describe("batched provided line endings", () => {
+  it("applies embedded separators from batch members", async () => {
+    await withTempFile("sample.txt", "a\nb\nc\n", async ({ cwd, path }) => {
+      const { getTool, handlers, ctx } = await setupBatchTools(cwd);
+      const readTool = getTool("read");
+      const editTool = getTool("replace");
+      const text = (await readTool.execute("r1", { path: "sample.txt" }, undefined, undefined, ctx)).content[0].text as string;
+      const aRef = anchorFor(text, "a");
+      const cRef = anchorFor(text, "c");
+      const firstArgs = { remove_from: aRef, remove_to: aRef, replacement_lines: ["A1\r\nA2"] };
+      const secondArgs = { remove_from: cRef, remove_to: cRef, replacement_lines: ["C"] };
+      const message = assistantMessage([toolCall("p1", "replace", firstArgs), toolCall("p2", "replace", secondArgs)]);
+      await (handlers.get("message_end")!({ type: "message_end", message }, ctx) as Promise<unknown>);
+      await editTool.execute("p1", firstArgs, undefined, undefined, ctx);
+      const last = await editTool.execute("p2", secondArgs, undefined, undefined, ctx);
+      expect(last.content[0].text).toContain("Batch 1: 2 edits applied as one commit");
+      expect(await readFile(path, "utf-8")).toBe("A1\r\nA2\nb\nC\n");
     });
   });
 });

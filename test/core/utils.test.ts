@@ -8,6 +8,7 @@ import {
   decodeStringArray,
   assertByteLimit,
   isModeUnsupported,
+  literalEscapeHint,
 } from "../../src/utils";
 
 describe("isRec", () => {
@@ -409,5 +410,31 @@ describe("isModeUnsupported", () => {
     expect(isModeUnsupported(Object.assign(new Error("denied"), { code: "EOPNOTSUPP" }))).toBe(true);
     expect(isModeUnsupported(Object.assign(new Error("denied"), { code: "EACCES" }))).toBe(false);
     expect(isModeUnsupported(new Error("denied"))).toBe(false);
+  });
+});
+
+describe("literalEscapeHint", () => {
+  it("reports the first literal escape sequence", () => {
+    expect(literalEscapeHint([String.raw`stable\u200bCheckout`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\u200b"`);
+    expect(literalEscapeHint([String.raw`a\nb`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\n"`);
+    expect(literalEscapeHint([String.raw`say \"hi\"`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\""`);
+    expect(literalEscapeHint([String.raw`\n\t`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\n"`);
+  });
+
+  it("returns undefined for real characters and plain text", () => {
+    expect(literalEscapeHint(["stable\u200bCheckout"], "lines")).toBeUndefined();
+    expect(literalEscapeHint(["a\nb"], "lines")).toBeUndefined();
+    expect(literalEscapeHint([String.raw`/^\d+\.\d+$/`], "lines")).toBeUndefined();
+    expect(literalEscapeHint([], "lines")).toBeUndefined();
+  });
+
+  it("skips valid surrogate pairs and the dedicated placeholder", () => {
+    expect(literalEscapeHint([String.raw`\uD83D\uDE00`], "lines")).toBeUndefined();
+    expect(literalEscapeHint([String.raw`\uDDDD`], "lines")).toBeUndefined();
+    expect(literalEscapeHint([String.raw`\uD83D`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\uD83D"`);
+  });
+
+  it("skips simple escapes in a line that also has a real break", () => {
+    expect(literalEscapeHint([String.raw`a\nb` + "\nc"], "lines")).toBeUndefined();
   });
 });

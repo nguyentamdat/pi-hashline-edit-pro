@@ -1,8 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { initHasher } from "./src/hashline";
+import { regReplaceWithin } from "./src/replace-within";
 import { regReplace } from "./src/replace";
 import { regInsert } from "./src/insert";
+import { regCopy, regMove } from "./src/copy-move";
 import { regGrep } from "./src/grep";
 import { regUndo, clearUndo } from "./src/replace-undo";
 import { regRead, fmtReadPreview } from "./src/read";
@@ -10,7 +12,7 @@ import { buildAutoReadAllInjection, autoReadAllBudget } from "./src/auto-read-al
 import { clearAutoReadAllComplete } from "./src/auto-read-all-state";
 import type { RMetrics } from "./src/replace-response";
 import type { ReplaceDetails } from "./src/replace";
-import { extractWarnings } from "./src/replace-render";
+import { extractHints, extractWarnings } from "./src/replace-render";
 import { MAX_HASH_LINES } from "./src/hashline";
 import type { AutoReadAllMode } from "./src/config";
 import {
@@ -18,13 +20,15 @@ import {
   toggleAutoRead,
   cycleAutoReadAllMode,
   toggleAnchorGrep,
+  toggleCopyMove,
+  toggleReplaceWithin,
   toggleRequirePath,
   toggleStrictInput,
   adjustDiffContextLines,
   setAutoReadAllIgnoreFromText,
 } from "./src/config";
 import { loadHashStore, pruneMissing } from "./src/hash-store";
-import { initRegistry, gcRegistrySidecars, clearRegistry, freeAnchors, sessionKeyFor, withAnchorSession, releaseRegistrySession } from "./src/anchor-registry";
+import { initRegistry, gcRegistrySidecars, clearRegistry, freeAnchors, sessionKeyFor, withAnchorSession, releaseRegistrySession, formatAnchorReclaimNotice, takeReclaimedPaths } from "./src/anchor-registry";
 import { serveRows } from "./src/served";
 import { finalizeTurn, planAssistantMessage } from "./src/batch";
 import { currentEditFlags } from "./src/edit-common";
@@ -41,7 +45,10 @@ export default function (pi: ExtensionAPI): void {
   regRead(pi);
 
   regReplace(pi);
+  regReplaceWithin(pi);
   regInsert(pi);
+  regCopy(pi);
+  regMove(pi);
   regGrep(pi);
   regUndo(pi);
   registerWriteHook(pi);
@@ -57,7 +64,11 @@ export default function (pi: ExtensionAPI): void {
       const flags = await currentEditFlags();
       regRead(pi, flags);
       regReplace(pi, flags);
+      regReplaceWithin(pi, flags);
       regInsert(pi, flags);
+      regCopy(pi, flags);
+      regMove(pi, flags);
+      regGrep(pi, flags);
       regUndo(pi, flags);
     } catch (error) {
       console.error("Failed to refresh edit tools:", error);
@@ -90,9 +101,12 @@ export default function (pi: ExtensionAPI): void {
     autoReadAllInjected = sessionBranch.some((entry) => entry.type === "custom_message" && entry.customType === AUTO_READ_ALL_CUSTOM_TYPE);
     await refreshEditTools();
     pi.setActiveTools(
-      pi.getActiveTools().filter((t) =>
-        config.anchorGrepEnabled ? t !== "grep" : t !== "anchor_grep",
-      ),
+      pi.getActiveTools().filter((t) => {
+        if (config.anchorGrepEnabled ? t === "grep" : t === "anchor_grep") return false;
+        if (config.copyMoveEnabled === false && (t === "copy" || t === "move")) return false;
+        if (config.replaceWithinEnabled === false && t === "replace_within") return false;
+        return true;
+      }),
     );
     const debugValue = process.env.PI_HASHLINE_DEBUG;
     if (debugValue === "1" || debugValue === "true") {
@@ -125,7 +139,7 @@ export default function (pi: ExtensionAPI): void {
   }));
 
   pi.registerCommand("hashline-config", {
-    description: "Open the hashline settings window (auto-read, auto-read all, ignore folders/files, diff context, grep, path, strict input)",
+    description: "Open the hashline settings window (auto-read, auto-read all, ignore folders/files, diff context, grep, copy/move, replace_within, path, strict input)",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("/hashline-config requires interactive mode", "error");
@@ -145,6 +159,16 @@ export default function (pi: ExtensionAPI): void {
               const enabled = await toggleAnchorGrep();
               const active = pi.getActiveTools();
               pi.setActiveTools(enabled ? [...new Set([...active.filter((t) => t !== "grep"), "anchor_grep"])] : [...new Set([...active.filter((t) => t !== "anchor_grep"), ...(grepWasActive ? ["grep"] : [])])]);
+            }
+            else if (key === "copyMoveEnabled") {
+              const enabled = await toggleCopyMove();
+              const active = pi.getActiveTools();
+              pi.setActiveTools(enabled ? [...new Set([...active, "copy", "move"])] : active.filter((t) => t !== "copy" && t !== "move"));
+            }
+            else if (key === "replaceWithinEnabled") {
+              const enabled = await toggleReplaceWithin();
+              const active = pi.getActiveTools();
+              pi.setActiveTools(enabled ? [...new Set([...active, "replace_within"])] : active.filter((t) => t !== "replace_within"));
             }
             else if (key === "requirePath") await toggleRequirePath();
             else if (key === "strictInput") await toggleStrictInput();
@@ -217,10 +241,11 @@ export default function (pi: ExtensionAPI): void {
         );
         const fileLines = splitLines(normalized);
         serveRows(absolutePath, fileHashes, fileLines, preview.servedHashes);
+        const reclaimNotice = formatAnchorReclaimNotice(takeReclaimedPaths());
         return {
           content: [
             ...(event.content ?? []),
-            { type: "text", text: `\n\n--- Auto-read (hashline anchors) ---\n${preview.text}` },
+            { type: "text", text: `\n\n--- Auto-read (hashline anchors) ---\n${preview.text}${reclaimNotice !== undefined ? `\n\n${reclaimNotice}` : ""}` },
           ],
         };
       } catch (error) {
@@ -237,7 +262,10 @@ export default function (pi: ExtensionAPI): void {
 
     if (
       event.toolName !== "replace" &&
+      event.toolName !== "replace_within" &&
       event.toolName !== "insert" &&
+      event.toolName !== "copy" &&
+      event.toolName !== "move" &&
       event.toolName !== "undo_last_change"
     ) return;
     if (!autoRead) return;
@@ -250,6 +278,7 @@ export default function (pi: ExtensionAPI): void {
     const toolDetails = event.details as ReplaceDetails | undefined;
     const diff = toolDetails?.diff;
     const detailWarnings = Array.isArray(toolDetails?.warnings) ? toolDetails.warnings.filter((w): w is string => typeof w === "string") : [];
+    const detailHints = Array.isArray(toolDetails?.hints) ? toolDetails.hints.filter((h): h is string => typeof h === "string") : [];
     if (typeof diff !== "string") return;
     const hasDiff = diff.length > 0;
 
@@ -261,12 +290,15 @@ export default function (pi: ExtensionAPI): void {
       .map((entry) => entry.text)
       .join("\n");
     const warnings = detailWarnings.length ? `Warnings:\n${detailWarnings.join("\n")}` : extractWarnings(rendered);
-    const hint = hasDiff ? (warnings ? `${diff}\n\n${warnings}` : diff) : warnings ? `[post-edit] applied successfully; the diff is empty (whitespace-only change).\n\n${warnings}` : "[post-edit] applied successfully; the diff is empty (whitespace-only change).";
+    const hints = detailHints.length ? `Hints:\n${detailHints.join("\n")}` : extractHints(rendered);
+    const notices = [warnings, hints].filter((part): part is string => part !== undefined).join("\n\n");
+    const emptyDiffNotice = "[post-edit] applied successfully; the diff is empty (no content change: whitespace or line endings only).";
+    const noticeText = hasDiff ? (notices ? `${diff}\n\n${notices}` : diff) : notices ? `${emptyDiffNotice}\n\n${notices}` : emptyDiffNotice;
     return {
       content: [
         {
           type: "text",
-          text: hint,
+          text: noticeText,
         },
       ],
     };

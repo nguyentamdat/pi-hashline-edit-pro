@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseText, parseHashRef } from "../../src/hashline";
+import { parseText, parseTextWithSeparators, parseHashRef } from "../../src/hashline";
 
 describe("parseHashRef", () => {
 	it("parses a hash anchor without # prefix", () => {
@@ -147,5 +147,33 @@ describe("parseText json-envelope autocorrect", () => {
 
 	it("unwraps a single-string wrapper without escapes", () => {
 		expect(parseText(['["hello"].'])).toEqual(["hello"]);
+	});
+});
+
+describe("parseTextWithSeparators", () => {
+	it("records the separator used inside an element", () => {
+		expect(parseTextWithSeparators(["a\r\nb"])).toEqual({ lines: ["a", "b"], separators: ["\r\n", undefined] });
+		expect(parseTextWithSeparators(["a\rb"])).toEqual({ lines: ["a", "b"], separators: ["\r", undefined] });
+		expect(parseTextWithSeparators(["a\nb"])).toEqual({ lines: ["a", "b"], separators: ["\n", undefined] });
+	});
+
+	it("marks element boundaries as unspecified", () => {
+		expect(parseTextWithSeparators(["a", "b"])).toEqual({ lines: ["a", "b"], separators: [undefined, undefined] });
+	});
+
+	it("handles mixed separators and trailing breaks", () => {
+		expect(parseTextWithSeparators(["a\r\nb\nc\r"])).toEqual({ lines: ["a", "b", "c"], separators: ["\r\n", "\n", "\r"] });
+	});
+
+	it("treats a trailing break as the last line's ending instead of a blank line", () => {
+		expect(parseTextWithSeparators(["a\n"])).toEqual({ lines: ["a"], separators: ["\n"] });
+		expect(parseTextWithSeparators(["a\r\nb\r\n"])).toEqual({ lines: ["a", "b"], separators: ["\r\n", "\r\n"] });
+		expect(parseTextWithSeparators(["\n"])).toEqual({ lines: [""], separators: ["\n"] });
+		expect(parseTextWithSeparators(["\n\n"])).toEqual({ lines: ["", ""], separators: ["\n", "\n"] });
+	});
+
+	it("keeps an explicit empty element as a blank line", () => {
+		expect(parseTextWithSeparators(["a\n", ""])).toEqual({ lines: ["a", ""], separators: ["\n", undefined] });
+		expect(parseTextWithSeparators(["a", ""])).toEqual({ lines: ["a", ""], separators: [undefined, undefined] });
 	});
 });

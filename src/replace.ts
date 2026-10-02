@@ -9,8 +9,8 @@ import {
   type LineEnding,
 } from "./replace-diff";
 import { readNormFile, type NormFile } from "./file-reader";
-import { editToolSchema, buildEditToolSchema, type ReqParams, assertReq, normReq } from "./payload-contract";
-import { splitLines } from "./utils";
+import { editToolSchema, buildEditToolSchema, type ReqParams, type RawReqParams, assertReq, normReq } from "./payload-contract";
+import { literalEscapeHint, splitLines } from "./utils";
 import { loadP, loadGuide } from "./prompts";
 import { type FileIdentity } from "./fs-write";
 import { applyEdit,
@@ -21,6 +21,7 @@ import { applyEdit,
   AnchorMismatchError,
   type HEdit,
   type NEdit,
+  type StripWarningLocation,
 } from "./hashline";
 import { type RMetrics } from "./replace-response";
 import {
@@ -47,6 +48,7 @@ export type ReplaceDetails = {
   metrics?: RMetrics;
   diffLineNumbers?: (number | null)[];
   warnings?: string[];
+  hints?: string[];
   batch?: { id: number; size: number; last: boolean; total: number; aborted?: boolean; abortMessage?: string };
 };
 
@@ -56,6 +58,7 @@ export interface PipelineResult {
   result: string;
   bom: string;
   originalEnding: LineEnding;
+  originalSeparators: LineEnding[];
   hadUtf8DecodeErrors: boolean;
   warnings: string[];
   noopEdit?: NEdit;
@@ -67,6 +70,7 @@ export interface PipelineResult {
   totalRemovedLines: number;
   identity: FileIdentity;
   spans?: DiffSpan[];
+  contentSeparators?: (LineEnding | undefined)[];
 }
 
 
@@ -76,6 +80,10 @@ export interface ExecPipelineOptions {
   store?: HashStore;
   noPersist?: boolean;
   preloadedNorm?: NormFile;
+  served?: ReadonlyMap<string, string>;
+  allowEmpty?: boolean;
+  stripWarning?: StripWarningLocation;
+  endingOverrides?: (LineEnding | undefined)[];
 }
 
 export function hashSpan(hashes: string[], from: string, to: string): [number, number] | undefined {
@@ -91,7 +99,7 @@ export function spanForEdit(originalHashes: string[], from: string, to: string, 
   const replacementCount = splitLines(resultContent).length - (originalHashes.length - (span[1] - span[0] + 1));
   return { start: span[0], end: span[1], replacementCount };
 }
-async function noteAnchorError(absolutePath: string, error: unknown, noPersist?: boolean): Promise<void> {
+export async function noteAnchorError(absolutePath: string, error: unknown, noPersist?: boolean): Promise<void> {
   if (noPersist === true) return;
   if (error instanceof RangeStaleError) {
     adoptAnchors(absolutePath, error.rangeServedMap);
@@ -113,32 +121,39 @@ function countLineChanges(
     totalRemovedLines,
   };
 }
-
-export function buildReplaceHEdit(params: ReqParams): { edit: HEdit; warnings: string[] } {
+export function buildReplaceHEdit(params: RawReqParams): { edit: HEdit; warnings: string[] } {
   const editWarnings: string[] = [];
-  const edit = resEdit(
-    {
-      remove_from: params.remove_from,
-      remove_to: params.remove_to,
-      replacement_lines: params.replacement_lines,
-    },
-    editWarnings,
-  );
+  const anchors = { remove_from: params.remove_from, remove_to: params.remove_to };
+  const edit = typeof params.replacement_lines === "string"
+    ? resEdit({ ...anchors, replacement_lines: params.replacement_lines }, editWarnings)
+    : resEdit({ ...anchors, replacement_lines: params.replacement_lines }, editWarnings);
   return { edit, warnings: editWarnings };
+}
+
+function withEndingOverrides(edit: HEdit, overrides: (LineEnding | undefined)[] | undefined): HEdit {
+  if (overrides === undefined) return edit;
+  const length = Math.max(edit.content_separators?.length ?? 0, overrides.length);
+  const separators: (LineEnding | undefined)[] = new Array(length);
+  for (let index = 0; index < length; index++) {
+    separators[index] = overrides[index] ?? edit.content_separators?.[index];
+  }
+  if (separators.every((ending) => ending === undefined)) return edit;
+  return { ...edit, content_separators: separators };
 }
 
 export async function execPipeline(
   targetPath: string,
-  params: ReqParams,
+  params: RawReqParams,
   cwd: string,
   options?: ExecPipelineOptions,
 ): Promise<PipelineResult> {
 
   const { edit, warnings: editWarnings } = buildReplaceHEdit(params);
+  const anchoredEdit = withEndingOverrides(edit, options?.endingOverrides);
   const hashStore = options?.store ?? await loadHashStore();
   const preResolvedPath = await resolveTarget(toCwd(targetPath, cwd));
-  const served = servedForPath(preResolvedPath);
-  const { normalized: originalNormalized, bom, originalEnding, fileHashes: originalHashes, hadUtf8DecodeErrors, absolutePath, identity } = await readNormFile(
+  const served = options?.served ?? servedForPath(preResolvedPath);
+  const { normalized: originalNormalized, bom, originalEnding, endingSeparators: originalSeparators, fileHashes: originalHashes, hadUtf8DecodeErrors, absolutePath, identity } = await readNormFile(
     targetPath, cwd, { signal: options?.signal, accessMode: options?.accessMode, maxLines: MAX_HASH_LINES, store: hashStore, noPersist: options?.noPersist, allocation: options?.noPersist ? "shadow" : "real", preloadedNorm: options?.preloadedNorm },
   );
   const displayPath = toDisplayPath(cwd, absolutePath, targetPath);
@@ -147,11 +162,13 @@ export async function execPipeline(
   try {
     anchorResult = applyEdit(
       originalNormalized,
-      edit,
+      anchoredEdit,
       options?.signal,
       originalHashes,
       displayPath,
       served,
+      options?.allowEmpty,
+      options?.stripWarning,
     );
   } catch (error) {
     await noteAnchorError(absolutePath, error, options?.noPersist);
@@ -181,6 +198,7 @@ export async function execPipeline(
     result,
     bom,
     originalEnding,
+    originalSeparators,
     hadUtf8DecodeErrors,
     warnings,
     noopEdit: anchorResult.noopEdit,
@@ -192,11 +210,15 @@ export async function execPipeline(
     totalRemovedLines,
     identity,
     ...(pipeSpans ? { spans: pipeSpans } : {}),
+    ...(anchoredEdit.content_separators !== undefined ? { contentSeparators: anchoredEdit.content_separators } : {}),
   };
 }
 
 export function previewFromPipe(pipe: PipelineResult): RPreview {
   if (pipe.originalNormalized === pipe.result) {
+    if (pipe.contentSeparators !== undefined) {
+      return { diff: "", path: pipe.path };
+    }
     return {
       error: `No changes made to ${pipe.path}. The edit produced identical content.`,
       path: pipe.path,
@@ -263,6 +285,7 @@ export function buildToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): ToolDef
         const canonical = normReq(params);
         assertReq(canonical);
         const normalizedParams = canonical;
+        const literalEscape = literalEscapeHint([normalizedParams.replacement_lines], "replacement_lines");
         const targetPath = await resolveEditTargetWithRequirement({
           removeFrom: normalizedParams.remove_from,
           removeTo: normalizedParams.remove_to,
@@ -287,6 +310,7 @@ export function buildToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): ToolDef
               absolutePath,
               mutationTargetPath,
               editAnchors: [normalizedParams.remove_from, normalizedParams.remove_to],
+              prefixWarnings: literalEscape !== undefined ? [literalEscape] : [],
               signal,
             });
           }
@@ -305,7 +329,7 @@ export function buildToolDef(flags: EditToolFlags = DEFAULT_EDIT_FLAGS): ToolDef
             cwd: ctx.cwd,
             signal,
             hedit: built.edit,
-            extraWarnings: built.warnings,
+            extraWarnings: [...(literalEscape !== undefined ? [literalEscape] : []), ...built.warnings],
           });
         });
       });

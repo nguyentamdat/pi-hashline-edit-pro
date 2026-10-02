@@ -11,10 +11,11 @@ import { globToRegex } from "./glob";
 import { MAX_HASH_LINES, fmtRow, HASH_LEN, HASH_SEP, HASH_CLASS } from "./hashline";
 import { ANCHOR_POOL_EXHAUSTED_PREFIX, MAX_GREP_LINE_BYTES } from "./constants";
 import { toCwd, toDisplayPath } from "./paths";
-import { loadP, loadGuide } from "./prompts";
+import { loadP } from "./prompts";
 import { normReq } from "./payload-contract";
+import { DEFAULT_EDIT_FLAGS, withGrepPrompts, type EditToolFlags } from "./edit-common";
 import { abortIf, clipLine, errCode, gutterWidth, isRec, makePrepareArguments, rejectUnknownFields, truncateToBytes, visLines } from "./utils";
-import { withAnchorSession } from "./anchor-registry";
+import { withAnchorSession, formatAnchorReclaimNotice, takeReclaimedPaths } from "./anchor-registry";
 import { serveRows } from "./served";
 import { Text } from "@earendil-works/pi-tui";
 import { expandHint, getResultText, reuseText, type CallT, type FgT } from "./replace-render";
@@ -298,14 +299,30 @@ export async function resolveRgPath(): Promise<string> {
   throw new Error("[E_ACCESS] ripgrep (rg) is required for grep but was not found. Install ripgrep or ensure pi can download it to ~/.pi/agent/bin.");
 }
 
+async function insideGitRepo(start: string): Promise<boolean> {
+  let current = start;
+  for (;;) {
+    try {
+      await stat(join(current, ".git"));
+      return true;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return false;
+      current = parent;
+    }
+  }
+}
+
 async function collectRgMatches(
   rgPath: string,
   pattern: string,
   searchPath: string,
   req: GrepReq,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  repoRooted: boolean,
 ): Promise<Map<string, number[]>> {
   const args = ["--json", "--line-number", "--color=never", "--hidden", "--glob", "!.git"];
+  if (!repoRooted) args.push("--no-require-git");
   const wanted = req.limit ?? 100;
   args.push("--max-count", String(wanted + 1));
   if (typeof req.glob === "string" && req.glob.length > 0) {
@@ -513,13 +530,13 @@ export function renderGrepResult(result: { content?: Array<{ type: string; text?
   if (lines.length > maxLines) shown.push(theme.fg("muted", `... ${lines.length - maxLines} more grep lines (${expandHint()})`));
   return reuseText(context, shown.join("\n"));
 }
-export function regGrep(pi: ExtensionAPI): void {
+export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FLAGS): void {
+  const prompted = withGrepPrompts({ description: loadP("../prompts/grep.md"), snippet: loadP("../prompts/grep-snippet.md") }, flags);
   pi.registerTool({
     name: "anchor_grep",
     label: "Anchor Grep",
-    description: loadP("../prompts/grep.md"),
-    promptSnippet: loadP("../prompts/grep-snippet.md"),
-    promptGuidelines: loadGuide("../prompts/grep-guidelines.md"),
+    description: prompted.description,
+    promptSnippet: prompted.snippet,
     prepareArguments: makePrepareArguments(),
     parameters: grepToolSchema,
     executionMode: "sequential",
@@ -583,7 +600,8 @@ export function regGrep(pi: ExtensionAPI): void {
         };
         const readGrepFile = makeGrepReader("real");
         const readGrepFileShadow = makeGrepReader("shadow");
-        const rgMatches = await collectRgMatches(rgPath, req.pattern, base, req, signal);
+        const repoRooted = await insideGitRepo(globRoot);
+        const rgMatches = await collectRgMatches(rgPath, req.pattern, base, req, signal, repoRooted);
         const sortedFiles = [...rgMatches.keys()].sort(cmp);
         for (let f = 0; f < sortedFiles.length; f++) {
           abortIf(signal);
@@ -660,6 +678,8 @@ export function regGrep(pi: ExtensionAPI): void {
           .map((hit) => `=== ${hit.displayPath} ===\n${hit.rows.join("\n")}`)
           .join("\n");
         const notes: string[] = [];
+        const reclaimNotice = formatAnchorReclaimNotice(takeReclaimedPaths());
+        if (reclaimNotice !== undefined) notes.push(reclaimNotice);
         if (rowTruncated) notes.push(`[grep: output truncated at ${DEFAULT_MAX_LINES} rows or ${formatSize(DEFAULT_MAX_BYTES)}; refine the pattern to see more.]`);
         if (limitTruncated) notes.push(`[grep: showing first ${limit} matches; increase limit to see more.]`);
         if (linesReplaced > 0) notes.push(`[grep: ${linesReplaced} line(s) exceed ${formatSize(MAX_GREP_LINE_BYTES)} and are shown as truncated fragments; use read to see the full lines.]`);

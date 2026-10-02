@@ -6,10 +6,12 @@ import { saveUndo } from "./replace-undo";
 import { getDiffContextLines } from "./config";
 import { safeSnapId } from "./file-reader";
 import { writeAtomic } from "./fs-write";
+import { formatAnchorReclaimNotice, takeReclaimedPaths } from "./anchor-registry";
 import { servedHashesFromDiff, serveRows } from "./served";
 import { lineHashes } from "./hashline";
 import { spanForEdit } from "./replace";
-import { restoreEndings, stripBOM, toLF } from "./normalize";
+import { restoreEndings, stripBOM, toLF, type LineEnding } from "./normalize";
+import { applyEndingOverrides, joinSeparators, separatorsForSpans } from "./line-endings";
 export interface CommitMeta {
   editAnchors?: [string, string];
   anchorCarry?: number;
@@ -21,14 +23,32 @@ export interface CommitMeta {
   noopNoun?: string;
   prefixWarnings?: string[];
   foldedAnchorLines?: number;
+  endingOverrides?: (LineEnding | undefined)[];
 }
 
 export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promise<TResult> {
   const { path, absolutePath, mutationTargetPath, signal } = meta;
   const warnings = [...(meta.prefixWarnings ?? []), ...pipe.warnings];
   const editsAttempted = 1;
+  const readReclaim = formatAnchorReclaimNotice(takeReclaimedPaths());
+  if (readReclaim !== undefined) warnings.push(readReclaim);
 
-  if (pipe.result === pipe.originalNormalized) {
+  const span = pipe.spans?.[0] ?? (meta.editAnchors ? spanForEdit(pipe.originalHashes, meta.editAnchors[0], meta.editAnchors[1], pipe.result) : undefined);
+  if (span && meta.anchorCarry !== undefined) span.carry = meta.anchorCarry;
+  const resultSeparators = span
+    ? separatorsForSpans(pipe.originalSeparators, pipe.originalHashes.length, [span], pipe.result, pipe.originalEnding)
+    : undefined;
+  if (resultSeparators !== undefined && span !== undefined) {
+    applyEndingOverrides(resultSeparators, span.start, pipe.contentSeparators);
+    applyEndingOverrides(resultSeparators, span.start, meta.endingOverrides);
+  }
+  const finalFileBytes = pipe.bom + (resultSeparators !== undefined
+    ? joinSeparators(pipe.result, resultSeparators)
+    : restoreEndings(pipe.result, pipe.originalEnding));
+  const contentUnchanged = pipe.result === pipe.originalNormalized;
+  const bytesUnchanged = contentUnchanged && (span === undefined || finalFileBytes === pipe.bom + joinSeparators(pipe.originalNormalized, pipe.originalSeparators));
+
+  if (bytesUnchanged) {
     const noopSnapshotId = await safeSnapId(absolutePath, "noop edit");
     return buildNoop(
       {
@@ -47,7 +67,6 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     );
   }
 
-  const finalFileBytes = pipe.bom + restoreEndings(pipe.result, pipe.originalEnding);
   assertByteLimit(finalFileBytes, path);
 
   if (pipe.hadUtf8DecodeErrors) {
@@ -77,8 +96,10 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     content: pipe.originalNormalized,
     bom: pipe.bom,
     originalEnding: pipe.originalEnding,
+    separators: pipe.originalSeparators,
     hashes: pipe.originalHashes,
     resultContent: pipe.result,
+    ...(resultSeparators !== undefined ? { resultSeparators } : {}),
   });
   if (!undo.persisted) {
     throw new Error(
@@ -107,8 +128,6 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     removedLines: pipe.totalRemovedLines,
   };
 
-  const span = meta.editAnchors ? spanForEdit(pipe.originalHashes, meta.editAnchors[0], meta.editAnchors[1], pipe.result) : undefined;
-  if (span && meta.anchorCarry !== undefined) span.carry = meta.anchorCarry;
   let resultHashes: string[];
   try {
     resultHashes = await lineHashes(pipe.result, mutationTargetPath, {
@@ -120,6 +139,8 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${detail} File was written; anchor finalization failed. One undo reverts. Call read for fresh anchors.`);
   }
+  const writeReclaim = formatAnchorReclaimNotice(takeReclaimedPaths());
+  if (writeReclaim !== undefined) warnings.push(writeReclaim);
   const successInput = {
     path,
     originalNormalized: pipe.originalNormalized,
