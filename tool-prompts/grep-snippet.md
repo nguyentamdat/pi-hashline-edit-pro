@@ -1,0 +1,1 @@
+Search with `lineNumber:│ anchor│content` hits (`lineNumber-│` for context) usable directly for `replace`/`insert`; use `literal`/`glob`/`context`

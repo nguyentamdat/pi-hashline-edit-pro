@@ -38,6 +38,7 @@ export {
 	stripDiffPrefixes,
 	type StripWarningLocation,
 	swapReversedRanges,
+	preserveDeletionSeparators,
 	assertRangeServed,
 	RangeStaleError,
 	AnchorMismatchError,
@@ -51,5 +52,4 @@ export {
 	fmtRegion,
 	fmtRow,
 	changedRange,
-	assertNotEmpty,
 } from "./apply";

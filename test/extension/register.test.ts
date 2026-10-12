@@ -21,10 +21,10 @@ describe("extension registration", () => {
 
     register(pi);
 
-    expect(toolNames.sort()).toEqual(["anchor_grep", "copy", "insert", "move", "read", "replace", "replace_within", "undo_last_change"]);
+    expect(toolNames.sort()).toEqual(["copy", "grep", "insert", "move", "read", "replace", "replace_match", "undo_last_change"]);
 
     expect(commandNames.sort()).toEqual(["clear-anchors", "hashline-config"]);
-    expect(eventNames.sort()).toEqual(["before_agent_start", "message_end", "session_shutdown", "session_start", "tool_call", "tool_result", "turn_end"]);
+    expect(eventNames.sort()).toEqual(["before_agent_start", "message_end", "model_select", "session_shutdown", "session_start", "tool_call", "tool_result", "turn_end"]);
   });
 });
 
@@ -34,8 +34,8 @@ describe("tool prompt file references", () => {
       new URL("../../src/replace.ts", import.meta.url),
       "utf-8",
     );
-    expect(source).toContain("../prompts/replace.md");
-    expect(source).toContain("../prompts/replace-snippet.md");
-    expect(source).toContain("../prompts/replace-guidelines.md");
+    expect(source).toContain("../tool-prompts/replace.md");
+    expect(source).toContain("../tool-prompts/replace-snippet.md");
+    expect(source).toContain("../tool-prompts/replace-guidelines.md");
   });
 });

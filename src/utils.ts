@@ -7,43 +7,32 @@ export function isRec(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function normalizeFilePath(record: Record<string, unknown>): void {
-  if (typeof record.path !== "string" && typeof record.file_path === "string") {
-    record.path = record.file_path;
-    delete record.file_path;
+
+export type AnchorPairName = "remove" | "replace";
+
+const ANCHOR_ALIASES: Record<AnchorPairName, Record<string, string>> = {
+  remove: { replace_from: "remove_from", replace_to: "remove_to" },
+  replace: { remove_from: "replace_from", remove_to: "replace_to" },
+};
+
+function normalizeAnchorAliases(record: Record<string, unknown>, pair: AnchorPairName): void {
+  for (const [alias, canonical] of Object.entries(ANCHOR_ALIASES[pair])) {
+    if (!(alias in record)) continue;
+    if (record[canonical] === undefined) record[canonical] = record[alias];
+    delete record[alias];
   }
 }
 
-export function normalizeAnchors(record: Record<string, unknown>): void {
-  if (typeof record.remove_from !== "string" && typeof record.replace_from === "string") {
-    record.remove_from = record.replace_from;
-    delete record.replace_from;
-  }
-  if (typeof record.remove_to !== "string" && typeof record.replace_to === "string") {
-    record.remove_to = record.replace_to;
-    delete record.replace_to;
-  }
-  if (typeof record.remove_from !== "string" && typeof record.from === "string") {
-    record.remove_from = record.from;
-    delete record.from;
-  }
-  if (typeof record.remove_to !== "string" && typeof record.to === "string") {
-    record.remove_to = record.to;
-    delete record.to;
-  }
-}
-
-export function normalizeRequest(input: unknown): unknown {
+export function normalizeRequest(input: unknown, pair?: AnchorPairName): unknown {
   if (!isRec(input)) return input;
   const record: Record<string, unknown> = { ...input };
-  normalizeFilePath(record);
-  normalizeAnchors(record);
   normalizeEditLines(record);
+  if (pair !== undefined) normalizeAnchorAliases(record, pair);
   return record;
 }
 
-export function makePrepareArguments(): (args: unknown) => any {
-  return normalizeRequest;
+export function makePrepareArguments(pair?: AnchorPairName): (args: unknown) => any {
+  return (args) => normalizeRequest(args, pair);
 }
 
 export function splitLines(text: string): string[] {
@@ -56,6 +45,10 @@ export function visLines(text: string): string[] {
   return text.length === 0 ? [] : splitLines(text);
 }
 
+
+export function isBlankLine(line: string | undefined): boolean {
+	return (line ?? "").trim().length === 0;
+}
 
 export function rejectUnknownFields(
   obj: Record<string, unknown>,
@@ -99,6 +92,35 @@ export function errCode(error: unknown): string | undefined {
 		return (error as NodeJS.ErrnoException).code;
 	}
 	return undefined;
+}
+
+const IO_ERROR_CODES: Record<string, string> = {
+  ENOENT: "E_NOT_FOUND",
+  EACCES: "E_ACCESS",
+  EPERM: "E_ACCESS",
+  EROFS: "E_ACCESS",
+  EISDIR: "E_ACCESS",
+  ENOTDIR: "E_ACCESS",
+  EEXIST: "E_ACCESS",
+  ELOOP: "E_ACCESS",
+  ENOSPC: "E_ACCESS",
+  EDQUOT: "E_ACCESS",
+  EMFILE: "E_ACCESS",
+  ENFILE: "E_ACCESS",
+  ENAMETOOLONG: "E_ACCESS",
+};
+
+export function ioErrorCode(error: unknown): string | undefined {
+  const code = errCode(error);
+  return code !== undefined ? IO_ERROR_CODES[code] : undefined;
+}
+
+export function mapIoError(error: unknown, action: string, path: string): Error {
+  if (error instanceof Error && /\[[EWH]_[A-Z0-9_]+\]/.test(error.message)) return error;
+  const mapped = ioErrorCode(error);
+  if (mapped === undefined) return error instanceof Error ? error : new Error(String(error));
+  const detail = error instanceof Error ? error.message : String(error);
+  return new Error(`[${mapped}] Cannot ${action} ${path}: ${detail}`);
 }
 
 export function isModeUnsupported(error: unknown): boolean {
@@ -327,7 +349,7 @@ function looksLikeStringArray(value: unknown): boolean {
 	return /^\[\s*['"]/.test(trimmed) && !trimmed.endsWith("].");
 }
 
-export function decodeStringArray(value: unknown, warnings?: string[], label = "replacement_lines"): string[] | undefined {
+export function decodeStringArray(value: unknown, warnings?: string[], label = "text"): string[] | undefined {
 	const candidate = typeof value === "string"
 		? value
 		: Array.isArray(value) && value.length === 1 && typeof value[0] === "string"
@@ -369,7 +391,7 @@ function legacyLinesToText(lines: string[]): string {
 }
 
 function normalizeEditLines(record: Record<string, unknown>): void {
-	for (const key of ["replacement_lines", "lines"]) {
+	for (const key of ["text"]) {
 		const value = record[key];
 		if (Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string")) {
 			record[key] = legacyLinesToText(value);
@@ -380,6 +402,7 @@ function normalizeEditLines(record: Record<string, unknown>): void {
 const LITERAL_ESCAPE_RE = /\\(?:u([0-9a-fA-F]{4})|([ntr"]))/g;
 
 const REAL_LINE_BREAK_RE = /[\n\r]/;
+const MAX_LITERAL_ESCAPE_HINTS = 3;
 
 function isSurrogateEscapePair(line: string, index: number, hex: string): boolean {
 	const code = Number.parseInt(hex, 16);
@@ -398,7 +421,9 @@ function isSurrogateEscapePair(line: string, index: number, hex: string): boolea
 	return false;
 }
 
-export function literalEscapeHint(lines: string[], label: string): string | undefined {
+export function literalEscapeHints(lines: string[], label: string): string[] {
+	const hints: string[] = [];
+	const seen = new Set<string>();
 	for (const line of lines) {
 		if (!line.includes("\\")) continue;
 		const hasRealBreak = REAL_LINE_BREAK_RE.test(line);
@@ -410,8 +435,12 @@ export function literalEscapeHint(lines: string[], label: string): string | unde
 				if (hex.toLowerCase() === "dddd") continue;
 				if (isSurrogateEscapePair(line, match.index, hex)) continue;
 			}
-			return `[H_LITERAL_ESCAPE] "${label}" contains the literal escaped text "${match[0]}"`;
+			const text = match[0];
+			if (seen.has(text)) continue;
+			seen.add(text);
+			hints.push(`[H_LITERAL_ESCAPE] ${label}: "${text}" written as literal text`);
+			if (hints.length >= MAX_LITERAL_ESCAPE_HINTS) return hints;
 		}
 	}
-	return undefined;
+	return hints;
 }

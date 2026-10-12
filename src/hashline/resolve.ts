@@ -1,4 +1,4 @@
-import { abortIf, rejectUnknownFields, clipLine, decodeStringArray, assertNoNul } from "../utils";
+import { abortIf, rejectUnknownFields, clipLine, decodeStringArray, assertNoNul, isBlankLine } from "../utils";
 import { parseHashRef, parsePayloadText, parseTextWithSeparators, type Anchor, type ParsedText } from "./parse";
 import { HASH_SEP, stripRowPrefix, lineChecksum, type RowPrefixKind } from "./hash";
 import { HASH_RUN } from "./alphabet";
@@ -33,13 +33,13 @@ export interface NEdit {
 }
 
 export type HTEdit = {
-  replacement_lines: string[];
+  text: string[];
   remove_from: string;
   remove_to: string;
 };
 
 export type HTPayloadEdit = {
-  replacement_lines: string;
+  text: string;
   remove_from: string;
   remove_to: string;
 };
@@ -93,7 +93,12 @@ export function fmtMismatchWithHashes(
   const out: string[] = [];
   const hashes: string[] = [];
   const servedMap = new Map<string, string>();
-  const notFound = mismatches;
+  const seen = new Set<string>();
+  const notFound = mismatches.filter((mismatch) => {
+    if (seen.has(mismatch.ref.hash)) return false;
+    seen.add(mismatch.ref.hash);
+    return true;
+  });
   if (notFound.length > 0) {
     const refList = notFound.map((m) => `"${m.ref.hash}"`).join(", ");
     out.push(
@@ -120,7 +125,7 @@ export function fmtMismatchWithHashes(
 }
 
 
-const ITEM_KS = new Set(["replacement_lines", "remove_from", "remove_to"]);
+const ITEM_KS = new Set(["text", "remove_from", "remove_to"]);
 
 function assertBounds(edit: Record<string, unknown>): void {
 	if ("remove_from" in edit && typeof edit.remove_from !== "string") {
@@ -141,23 +146,23 @@ function assertBounds(edit: Record<string, unknown>): void {
 }
 
 function assertItem(edit: Record<string, unknown>): void {
-	rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { replacement_lines, remove_from, remove_to }.");
+	rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { text, remove_from, remove_to }.");
 	assertBounds(edit);
-	if (!("replacement_lines" in edit)) {
-		throw new Error(`[E_BAD_SHAPE] The edit requires a "replacement_lines" array (use [] to delete).`);
+	if (!("text" in edit)) {
+		throw new Error(`[E_BAD_SHAPE] The edit requires a "text" array (use [] to delete).`);
 	}
-	if (!Array.isArray(edit.replacement_lines) || edit.replacement_lines.some((line) => typeof line !== "string")) {
+	if (!Array.isArray(edit.text) || edit.text.some((line) => typeof line !== "string")) {
 		throw new Error(NEW_CONTENT_NOT_ARRAY_MSG);
 	}
 }
 
 function assertPayloadItem(edit: Record<string, unknown>): void {
-	rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { replacement_lines, remove_from, remove_to }.");
+	rejectUnknownFields(edit, ITEM_KS, "Edit", "The edit takes only { text, remove_from, remove_to }.");
 	assertBounds(edit);
-	if (!("replacement_lines" in edit)) {
-		throw new Error(`[E_BAD_SHAPE] The edit requires a "replacement_lines" string (use "" to delete).`);
+	if (!("text" in edit)) {
+		throw new Error(`[E_BAD_SHAPE] The edit requires a "text" string (use "" to delete).`);
 	}
-	if (typeof edit.replacement_lines !== "string") {
+	if (typeof edit.text !== "string") {
 		throw new Error(NEW_CONTENT_NOT_STRING_MSG);
 	}
 }
@@ -194,13 +199,19 @@ export function stripAnchorRow(
 	return match[2]!;
 }
 
-export function resEdit(edit: HTEdit | HTPayloadEdit, warnings?: string[]): HEdit {
-	if (typeof edit.replacement_lines === "string") {
+export type HTextInput = {
+  text: string | string[];
+  remove_from: string;
+  remove_to: string;
+};
+
+export function resEdit(edit: HTextInput, warnings?: string[]): HEdit {
+	if (typeof edit.text === "string") {
 		assertPayloadItem(edit as unknown as Record<string, unknown>);
-		return resolveParsedEdit(edit.remove_from, edit.remove_to, parsePayloadText(edit.replacement_lines), warnings);
+		return resolveParsedEdit(edit.remove_from, edit.remove_to, parsePayloadText(edit.text), warnings);
 	}
 	assertItem(edit as Record<string, unknown>);
-	const parsed = parseTextWithSeparators(decodeStringArray(edit.replacement_lines, warnings) ?? edit.replacement_lines);
+	const parsed = parseTextWithSeparators(decodeStringArray(edit.text, warnings) ?? edit.text);
 	return resolveParsedEdit(edit.remove_from, edit.remove_to, parsed, warnings);
 }
 
@@ -241,7 +252,7 @@ function stripRowPrefixes(
 	return { ...edit, content_lines: contentLines };
 }
 
-const DEFAULT_STRIP_WARNING_LOCATION: StripWarningLocation = { label: "replacement_lines", indexOffset: 0 };
+const DEFAULT_STRIP_WARNING_LOCATION: StripWarningLocation = { label: "text", indexOffset: 0 };
 
 export function stripBarePrefixes(edit: HEdit, warnings: string[], location: StripWarningLocation = DEFAULT_STRIP_WARNING_LOCATION): HEdit {
 	return stripRowPrefixes(edit, warnings, ["bare"], "[W_BARE_HASH_PREFIX]", '"anchor│" prefix', location);
@@ -270,6 +281,26 @@ export function swapReversedRanges(
 		return edit;
 	}
 	return { ...edit, hash_bounds: [endRef, startRef] as [Anchor, Anchor] };
+}
+
+export function preserveDeletionSeparators(edit: HEdit, fileLines: string[], fileHashes: string[]): HEdit {
+	if (edit.content_lines.length > 0) return edit;
+	const lineByHash = new Map<string, number>();
+	for (let index = 0; index < fileHashes.length; index++) {
+		const hash = fileHashes[index]!;
+		if (!lineByHash.has(hash)) lineByHash.set(hash, index);
+	}
+	const fromLine = lineByHash.get(edit.hash_bounds[0].hash);
+	const toLine = lineByHash.get(edit.hash_bounds[1].hash);
+	if (fromLine === undefined || toLine === undefined) return edit;
+	const rangeStart = Math.min(fromLine, toLine);
+	const rangeEnd = Math.max(fromLine, toLine);
+	let start = rangeStart;
+	let end = rangeEnd;
+	while (start <= end && isBlankLine(fileLines[start])) start += 1;
+	while (end >= start && isBlankLine(fileLines[end])) end -= 1;
+	if (start > end || (start === rangeStart && end === rangeEnd)) return edit;
+	return { ...edit, hash_bounds: [{ hash: fileHashes[start]! }, { hash: fileHashes[end]! }] };
 }
 
 export function valEdit(
@@ -380,10 +411,12 @@ export function assertRangeServed(
   const startLine = resolved.hash_bounds[0].line;
   const endLine = resolved.hash_bounds[1].line;
   const mismatchLines: number[] = [];
+  const deletion = resolved.content_lines.length === 0;
   for (let line = startLine; line <= endLine; line++) {
     const hash = fileHashes[line - 1]!;
     const content = fileLines[line - 1]!;
     const servedContent = served?.get(hash);
+    if (servedContent === undefined && deletion && line !== startLine && line !== endLine) continue;
     if (servedContent === undefined || servedContent !== lineChecksum(content)) mismatchLines.push(line);
   }
   if (mismatchLines.length === 0) return;

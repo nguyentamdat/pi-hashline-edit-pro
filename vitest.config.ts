@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { coverageConfigDefaults, defineConfig } from "vitest/config";
 
 export const mockIsolatedFiles = [
   "test/core/config-atomic.test.ts",
@@ -28,7 +28,6 @@ export const heavyTestFiles = [
 export function buildTestConfig(extraExcludes: string[] = []) {
   return defineConfig({
     test: {
-      setupFiles: ["./test/support/registry-cleanup.ts"],
       testTimeout: 15000,
       projects: [
         {
@@ -43,7 +42,7 @@ export function buildTestConfig(extraExcludes: string[] = []) {
         {
           test: {
             name: "shared",
-            setupFiles: ["./test/support/env-isolation.ts"],
+            setupFiles: ["./test/support/registry-cleanup.ts", "./test/support/env-isolation.ts"],
             include: ["test/**/*.test.ts"],
             exclude: [...mockIsolatedFiles, ...extraExcludes],
             isolate: false,
@@ -51,6 +50,9 @@ export function buildTestConfig(extraExcludes: string[] = []) {
           },
         },
       ],
+      coverage: {
+        exclude: [...coverageConfigDefaults.exclude, "**/src/outline/vendor/**"],
+      },
     },
   });
 }

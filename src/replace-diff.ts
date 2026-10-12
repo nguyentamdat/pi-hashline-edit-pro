@@ -8,7 +8,7 @@ import {
   changedRange,
 } from "./hashline";
 import { MAX_DIFF_INPUT_BYTES } from "./constants";
-import { splitLines } from "./utils";
+import { isBlankLine, splitLines } from "./utils";
 import {
   detectEnding,
   toLF,
@@ -39,10 +39,6 @@ function fmtDiffLine(
   hash: string | undefined,
 ): string {
   return `${prefix}${hash ?? " ".repeat(ANCHOR_LEN)}${HASH_SEP}${line}`;
-}
-
-function isBlankLine(line: string): boolean {
-  return line.trim().length === 0;
 }
 
 const ELLIPSIS_MARKER: unique symbol = Symbol("ellipsis");
@@ -167,6 +163,8 @@ function trimPlacedSpans(
   placed: PlacedSpan[],
   oldLines: string[],
   newLines: string[],
+  oldHashes: string[],
+  newHashes: string[],
 ): PlacedSpan[] {
   const out: PlacedSpan[] = [];
   for (const span of placed) {
@@ -174,11 +172,11 @@ function trimPlacedSpans(
     let oldEnd = span.oldEnd;
     let newStart = span.newStart;
     let newEnd = span.newEnd;
-    while (oldStart <= oldEnd && newStart <= newEnd && oldLines[oldStart] === newLines[newStart]) {
+    while (oldStart <= oldEnd && newStart <= newEnd && oldLines[oldStart] === newLines[newStart] && oldHashes[oldStart] === newHashes[newStart]) {
       oldStart += 1;
       newStart += 1;
     }
-    while (oldStart <= oldEnd && newStart <= newEnd && oldLines[oldEnd] === newLines[newEnd]) {
+    while (oldStart <= oldEnd && newStart <= newEnd && oldLines[oldEnd] === newLines[newEnd] && oldHashes[oldEnd] === newHashes[newEnd]) {
       oldEnd -= 1;
       newEnd -= 1;
     }
@@ -255,7 +253,7 @@ function genSpanDiff(
   if (oldHashes.length !== oldLines.length || newHashes.length !== newLines.length) return undefined;
   const placed = placeSpans(oldLines.length, newLines.length, spans);
   if (!placed) return undefined;
-  const trimmed = trimPlacedSpans(placed, oldLines, newLines);
+  const trimmed = trimPlacedSpans(placed, oldLines, newLines, oldHashes, newHashes);
   const ordered = [...trimmed].sort((a, b) => a.oldStart - b.oldStart || a.newStart - b.newStart);
   let oldPos = 0;
   let newPos = 0;

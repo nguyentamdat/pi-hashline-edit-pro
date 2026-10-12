@@ -9,7 +9,7 @@ describe("insert and grep loop", () => {
   it("read → grep → insert → undo", async () => {
     await withTempFile("sample.ts", "alpha\nbeta\ngamma\n", async ({ cwd, path }) => {
       const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
-      const grepTool = getTool("anchor_grep");
+      const grepTool = getTool("grep");
       const insertTool = getTool("insert");
       const undo = getTool("undo_last_change");
 
@@ -25,7 +25,7 @@ describe("insert and grep loop", () => {
 
       const inserted = await insertTool.execute(
         "i1",
-        { anchor: betaHash, direction: "after", lines: ["BETA1"] },
+        { anchor: betaHash, direction: "after", text: ["BETA1"] },
         undefined, undefined, ctx,
       );
       expect(inserted.content[0].text).toContain("Successfully inserted");
@@ -44,7 +44,7 @@ describe("insert and grep loop", () => {
       await writeFile(join(dir, "lib", "b.ts"), "beta\n", "utf-8");
 
       const { ctx, getTool } = setupIntegrationTest(dir);
-      const grepTool = getTool("anchor_grep");
+      const grepTool = getTool("grep");
       const insertTool = getTool("insert");
 
       const result = await grepTool.execute(
@@ -58,7 +58,7 @@ describe("insert and grep loop", () => {
 
       await insertTool.execute(
         "i1",
-        { anchor: betaHash, direction: "after", lines: ["BETA2"] },
+        { anchor: betaHash, direction: "after", text: ["BETA2"] },
         undefined, undefined, ctx,
       );
       expect(await readFile(join(dir, "lib", "b.ts"), "utf-8")).toBe("beta\nBETA2\n");
@@ -76,7 +76,7 @@ describe("insert and grep loop", () => {
 
       const first = await insertTool.execute(
         "i1",
-        { anchor: alphaHash, direction: "after", lines: ["mid1"] },
+        { anchor: alphaHash, direction: "after", text: ["mid1"] },
         undefined, undefined, ctx,
       );
       const diff = (first.details as { diff?: string } | undefined)?.diff ?? "";
@@ -84,7 +84,7 @@ describe("insert and grep loop", () => {
 
       const second = await insertTool.execute(
         "i2",
-        { anchor: mid1Row, direction: "after", lines: ["mid2"] },
+        { anchor: mid1Row, direction: "after", text: ["mid2"] },
         undefined, undefined, ctx,
       );
       expect(second.content[0].text).toContain("Stripped diff-preview marker from anchor entry");

@@ -7,15 +7,14 @@ import register from "../../index";
 import { loadHashStore, shutdownHashStore } from "../../src/hash-store";
 import { initRegistry, resetRegistryForTests } from "../../src/anchor-registry";
 import { resetBatchStateForTests } from "../../src/batch";
-import { clearAllAutoReadAllComplete } from "../../src/auto-read-all-state";
 import { errCode } from "../../src/utils";
-const envRestores: Array<() => void> = [];
+import { HashlineConfigOverlay } from "../../src/config-ui";
+import { drainEnvRestores, pushEnvRestore } from "./env-restores";
 
 afterEach(() => {
-  while (envRestores.length > 0) envRestores.pop()!();
+  drainEnvRestores();
   resetRegistryForTests();
   resetBatchStateForTests();
-  clearAllAutoReadAllComplete();
 });
 
 export async function getWritableTempRoot(): Promise<string> {
@@ -154,7 +153,7 @@ export async function withTempDir(
 }
 export async function makeTempDir(prefix: string): Promise<string> {
   const dir = await mkdtemp(join(await getWritableTempRoot(), prefix));
-  envRestores.push(withHome(dir));
+  pushEnvRestore(withHome(dir));
   return dir;
 }
 export function makeFakePiRegistry() {
@@ -221,6 +220,19 @@ export function setupReadTest(cwd: string) {
 export function getText(result: { content: Array<{ text?: string }> }): string {
   return result.content[0]?.text ?? "";
 }
+export async function toolError(run: () => Promise<{ content: readonly unknown[]; isError?: boolean }>): Promise<string> {
+  let result: { content: readonly unknown[]; isError?: boolean };
+  try {
+    result = await run();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const first = result.content[0] as { text?: string } | undefined;
+  const text = typeof first?.text === "string" ? first.text : "";
+  if (result.isError !== true) throw new Error(`Expected a tool error, got: ${text}`);
+  return text;
+}
+
 export function extractHash(line: string): string {
   const m = line.match(/([A-Za-z]{4})│/);
   return m ? m[1]! : line.split("│")[0]!;
@@ -266,6 +278,22 @@ export function makePiStub(initialTools: string[] = []) {
   };
   return { pi, handlers, commands, tools, notify, getTool, getActive: () => [...active] };
 }
+
+export function makeConfigOverlay(input: {
+  onToggle: (key: string, delta?: number, value?: string) => Promise<void>;
+  done?: () => void;
+  maxHeight?: () => number | undefined;
+}): HashlineConfigOverlay {
+  const theme = { fg: (_area: string, text: string) => text, bold: (text: string) => text } as never;
+  return new HashlineConfigOverlay({
+    tui: { requestRender: () => undefined },
+    theme,
+    done: input.done ?? (() => undefined),
+    maxHeight: input.maxHeight,
+    onToggle: input.onToggle,
+  });
+}
+
 export function expectedEditContent(
   lines: string[],
   s: number,

@@ -31,7 +31,7 @@ describe("insert anchor preservation", () => {
       const bHash = anchorFor(text, "bbb");
       const result = await getTool("insert").execute(
         "i1",
-        { anchor: bHash, direction: "before", lines: ["xxx"] },
+        { anchor: bHash, direction: "before", text: ["xxx"] },
         undefined,
         undefined,
         ctx,
@@ -40,13 +40,44 @@ describe("insert anchor preservation", () => {
       expect(liveAnchor(diff, "bbb")).toBe(bHash);
       const ok = await getTool("replace").execute(
         "e1",
-        { remove_from: bHash, remove_to: bHash, replacement_lines: ["BBB"] },
+        { remove_from: bHash, remove_to: bHash, text: ["BBB"] },
         undefined,
         undefined,
         ctx,
       );
       expect(ok.content[0].text).toContain("Successfully replaced");
       expect(await readFile(join(cwd, "solo-before.txt"), "utf-8")).toBe("aaa\nxxx\nBBB\nccc\n");
+    });
+  });
+
+  it("solo insert-before with identical content puts the fresh anchor on the added row", async () => {
+    await withTempFile("dup-before.txt", "aaa\nbbb\nccc\n", async ({ cwd }) => {
+      const { ctx, readTool, getTool } = setupIntegrationTest(cwd);
+      const text = getText(await readTool.execute("r1", { path: "dup-before.txt" }, undefined, undefined, ctx));
+      const bHash = anchorFor(text, "bbb");
+      const result = await getTool("insert").execute(
+        "i1",
+        { anchor: bHash, direction: "before", text: ["bbb"] },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const diff = (result.details as { diff?: string }).diff ?? "";
+      const addedRow = diff.split("\n").find((row) => row.startsWith("+"));
+      expect(addedRow).toBeDefined();
+      const addedAnchor = /^\+([A-Za-z]{4})│/.exec(addedRow!)?.[1];
+      expect(addedAnchor).toBeDefined();
+      expect(addedAnchor).not.toBe(bHash);
+      expect(diff.split("\n").some((row) => row.startsWith(" ") && row.includes(`│bbb`) && row.includes(bHash))).toBe(true);
+      const ok = await getTool("replace").execute(
+        "e1",
+        { remove_from: addedAnchor!, remove_to: addedAnchor!, text: ["BBB"] },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(ok.content[0].text).toContain("Successfully replaced");
+      expect(await readFile(join(cwd, "dup-before.txt"), "utf-8")).toBe("aaa\nBBB\nbbb\nccc\n");
     });
   });
 
@@ -57,15 +88,15 @@ describe("insert anchor preservation", () => {
       const bHash = anchorFor(text, "bbb");
       const cHash = anchorFor(text, "ccc");
       const message = assistantMessage([
-        toolCall("i1", "insert", { anchor: bHash, direction: "before", lines: ["xxx"] }),
-        toolCall("i2", "insert", { anchor: cHash, direction: "after", lines: ["yyy"] }),
+        toolCall("i1", "insert", { anchor: bHash, direction: "before", text: ["xxx"] }),
+        toolCall("i2", "insert", { anchor: cHash, direction: "after", text: ["yyy"] }),
       ]);
       await handlers.get("message_end")!({ type: "message_end", message }, ctx);
       const insertTool = getTool("insert");
-      await insertTool.execute("i1", { anchor: bHash, direction: "before", lines: ["xxx"] }, undefined, undefined, ctx);
+      await insertTool.execute("i1", { anchor: bHash, direction: "before", text: ["xxx"] }, undefined, undefined, ctx);
       const second = await insertTool.execute(
         "i2",
-        { anchor: cHash, direction: "after", lines: ["yyy"] },
+        { anchor: cHash, direction: "after", text: ["yyy"] },
         undefined,
         undefined,
         ctx,
@@ -74,7 +105,7 @@ describe("insert anchor preservation", () => {
       expect(liveAnchor(diff, "bbb")).toBe(bHash);
       const ok = await getTool("replace").execute(
         "e1",
-        { remove_from: bHash, remove_to: bHash, replacement_lines: ["BBB"] },
+        { remove_from: bHash, remove_to: bHash, text: ["BBB"] },
         undefined,
         undefined,
         ctx,
@@ -90,15 +121,15 @@ describe("insert anchor preservation", () => {
       const text = getText(await readTool.execute("r1", { path: "merged.txt" }, undefined, undefined, ctx));
       const twoHash = anchorFor(text, "two");
       const message = assistantMessage([
-        toolCall("m1", "insert", { anchor: twoHash, direction: "before", lines: ["ONE-A"] }),
-        toolCall("m2", "insert", { anchor: twoHash, direction: "after", lines: ["TWO-A"] }),
+        toolCall("m1", "insert", { anchor: twoHash, direction: "before", text: ["ONE-A"] }),
+        toolCall("m2", "insert", { anchor: twoHash, direction: "after", text: ["TWO-A"] }),
       ]);
       await handlers.get("message_end")!({ type: "message_end", message }, ctx);
       const insertTool = getTool("insert");
-      await insertTool.execute("m1", { anchor: twoHash, direction: "before", lines: ["ONE-A"] }, undefined, undefined, ctx);
+      await insertTool.execute("m1", { anchor: twoHash, direction: "before", text: ["ONE-A"] }, undefined, undefined, ctx);
       const second = await insertTool.execute(
         "m2",
-        { anchor: twoHash, direction: "after", lines: ["TWO-A"] },
+        { anchor: twoHash, direction: "after", text: ["TWO-A"] },
         undefined,
         undefined,
         ctx,
@@ -107,7 +138,7 @@ describe("insert anchor preservation", () => {
       expect(liveAnchor(diff, "two")).toBe(twoHash);
       const ok = await getTool("replace").execute(
         "e1",
-        { remove_from: twoHash, remove_to: twoHash, replacement_lines: ["TWO"] },
+        { remove_from: twoHash, remove_to: twoHash, text: ["TWO"] },
         undefined,
         undefined,
         ctx,
@@ -143,7 +174,7 @@ describe("insert anchor preservation", () => {
       const emptyHash = text.split("\n")[0]!.split("│")[0]!;
       const result = await getTool("insert").execute(
         "i1",
-        { anchor: emptyHash, direction: "after", lines: ["first", "second"] },
+        { anchor: emptyHash, direction: "after", text: ["first", "second"] },
         undefined,
         undefined,
         ctx,
@@ -153,7 +184,7 @@ describe("insert anchor preservation", () => {
       expect(liveAnchor(diff, "second")).not.toBe(emptyHash);
       const ok = await getTool("replace").execute(
         "e1",
-        { remove_from: liveAnchor(diff, "first")!, remove_to: liveAnchor(diff, "second")!, replacement_lines: ["only"] },
+        { remove_from: liveAnchor(diff, "first")!, remove_to: liveAnchor(diff, "second")!, text: ["only"] },
         undefined,
         undefined,
         ctx,
@@ -172,7 +203,7 @@ describe("insert anchor preservation", () => {
       const cHash = anchorFor(text, "ccc");
       const result = await getTool("replace").execute(
         "e1",
-        { remove_from: bHash, remove_to: bHash, replacement_lines: ["BBB"] },
+        { remove_from: bHash, remove_to: bHash, text: ["BBB"] },
         undefined,
         undefined,
         ctx,

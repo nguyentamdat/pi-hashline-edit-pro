@@ -2,11 +2,12 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RG_TIMEOUT_MS } from "../../src/grep";
-import { setupIntegrationTest, withTempDir } from "../support/fixtures";
+import { setupIntegrationTest, withTempDir, toolError } from "../support/fixtures";
 
 const state = vi.hoisted(() => ({
   mode: "exit" as "exit" | "spawn-error" | "hang",
   child: null as { killed: boolean; kill(signal?: string): boolean } | null,
+  onSpawn: null as (() => void) | null,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -28,6 +29,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     spawn: () => {
       const child = new FakeChild();
       state.child = child;
+      state.onSpawn?.();
       setImmediate(() => {
         if (state.mode === "spawn-error") {
           child.emit("error", new Error("spawn rg ENOENT"));
@@ -43,22 +45,23 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-function runGrep(dir: string, pattern: string): Promise<unknown> {
+function runGrep(dir: string, pattern: string): Promise<{ content: readonly unknown[]; isError?: boolean }> {
   const { ctx, getTool } = setupIntegrationTest(dir);
-  return getTool("anchor_grep").execute("g1", { pattern, path: "sample.txt" }, undefined, undefined, ctx);
+  return getTool("grep").execute("g1", { pattern, path: "sample.txt" }, undefined, undefined, ctx);
 }
 
 beforeEach(() => {
   state.mode = "exit";
   state.child = null;
+  state.onSpawn = null;
 });
 
-describe("anchor_grep ripgrep failure contract", () => {
+describe("grep ripgrep failure contract", () => {
   it("codes a spawn failure as [E_GREP_FAILED]", async () => {
     await withTempDir("grep-rg-spawn-", async (dir) => {
       await writeFile(join(dir, "sample.txt"), "alpha\n", "utf-8");
       state.mode = "spawn-error";
-      await expect(runGrep(dir, "alpha")).rejects.toThrow(
+      expect(await toolError(() => runGrep(dir, "alpha"))).toMatch(
         /\[E_GREP_FAILED\] ripgrep could not start: spawn rg ENOENT/,
       );
     });
@@ -68,7 +71,7 @@ describe("anchor_grep ripgrep failure contract", () => {
     await withTempDir("grep-rg-exit-", async (dir) => {
       await writeFile(join(dir, "sample.txt"), "alpha\n", "utf-8");
       state.mode = "exit";
-      await expect(runGrep(dir, "alpha")).rejects.toThrow(
+      expect(await toolError(() => runGrep(dir, "alpha"))).toMatch(
         /\[E_GREP_FAILED\] ripgrep exited with code 2: regex parse error: look-around is not supported/,
       );
     });
@@ -81,12 +84,16 @@ describe("anchor_grep ripgrep failure contract", () => {
       const { ctx, getTool } = setupIntegrationTest(dir);
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
-        const pending = getTool("anchor_grep")
+        const spawned = new Promise<void>((resolve) => {
+          state.onSpawn = resolve;
+        });
+        const pending = getTool("grep")
           .execute("g1", { pattern: "alpha", path: "sample.txt" }, undefined, undefined, ctx)
-          .then(() => "", (error: unknown) => (error instanceof Error ? error.message : String(error)));
-        for (let attempt = 0; attempt < 400 && state.child === null; attempt += 1) {
-          await vi.advanceTimersByTimeAsync(5);
-        }
+          .then((result: { content: readonly unknown[] }) => {
+            const first = result.content[0] as { text?: string } | undefined;
+            return first?.text ?? "";
+          });
+        await spawned;
         expect(state.child).not.toBeNull();
         await vi.advanceTimersByTimeAsync(RG_TIMEOUT_MS);
         expect(await pending).toContain("[E_GREP_TIMEOUT]");

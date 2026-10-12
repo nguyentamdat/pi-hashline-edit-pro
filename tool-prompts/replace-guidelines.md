@@ -1,0 +1,3 @@
+- `replace`: same-message calls must target disjoint ranges.
+- `replace`: a pure deletion (`text: ""`) is the cheap way to clear a large range: it verifies only the first and last line against the served record and removes the interior as it currently stands.
+- `replace`: for a single line, use the same anchor for `remove_from` and `remove_to`.

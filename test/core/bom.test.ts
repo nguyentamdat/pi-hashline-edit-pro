@@ -33,7 +33,7 @@ describe("UTF-8 BOM preservation", () => {
       const bHash = extractHash(lines.find((l) => l.includes("│bbb"))!);
       await editTool.execute(
         "e1",
-        { remove_from: bHash, remove_to: bHash, replacement_lines: ["BBB"] },
+        { remove_from: bHash, remove_to: bHash, text: ["BBB"] },
         undefined,
         undefined,
         ctx,
@@ -50,13 +50,14 @@ describe("UTF-8 BOM preservation", () => {
       const readResult = await readTool.execute("r1", { path: "bom-insert.ts" }, undefined, undefined, ctx);
       const lines = getText(readResult).split("\n");
       const bHash = extractHash(lines.find((l) => l.includes("│bbb"))!);
-      await insertTool.execute(
+      const insertResult = await insertTool.execute(
         "i1",
-        { anchor: bHash, direction: "after", lines: ["new"] },
+        { anchor: bHash, direction: "after", text: ["new"] },
         undefined,
         undefined,
         ctx,
       );
+      expect(insertResult.isError, getText(insertResult)).not.toBe(true);
       expect(await readFile(path, "utf-8")).toBe(`${BOM}aaa\nbbb\nnew\n`);
     });
   });
@@ -72,7 +73,7 @@ describe("UTF-8 BOM preservation", () => {
       const bHash = extractHash(lines.find((l) => l.includes("│bbb"))!);
       await editTool.execute(
         "e1",
-        { remove_from: bHash, remove_to: bHash, replacement_lines: ["BBB"] },
+        { remove_from: bHash, remove_to: bHash, text: ["BBB"] },
         undefined,
         undefined,
         ctx,
@@ -93,7 +94,7 @@ describe("UTF-8 BOM preservation", () => {
       const bHash = extractHash(lines.find((l) => l.includes("│bbb"))!);
       await editTool.execute(
         "e1",
-        { remove_from: bHash, remove_to: bHash, replacement_lines: ["BBB"] },
+        { remove_from: bHash, remove_to: bHash, text: ["BBB"] },
         undefined,
         undefined,
         ctx,

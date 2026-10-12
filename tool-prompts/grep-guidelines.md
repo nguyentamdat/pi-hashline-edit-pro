@@ -1,0 +1,2 @@
+- `grep`: set `literal: true` when the pattern contains regex metacharacters.
+- `grep`: `N:│` rows are matches and `N-│` rows are context;

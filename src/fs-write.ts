@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, parse, resolve, sep } from "node:path";
 import { toCwd } from "./paths";
-import { errCode, isModeUnsupported } from "./utils";
+import { errCode, isModeUnsupported, mapIoError } from "./utils";
 
 export interface FileIdentity {
   dev: number;
@@ -38,7 +38,6 @@ export async function resolveTarget(path: string): Promise<string> {
     .slice(root.length)
     .split(sep)
     .filter((part) => part.length > 0);
-  const visitedSymlinks = new Set<string>();
 
   async function resParts(
     currentPath: string,
@@ -64,15 +63,6 @@ export async function resolveTarget(path: string): Promise<string> {
       if (!candidateStats.isSymbolicLink()) {
         return resParts(candidatePath, tail, symlinkDepth);
       }
-
-      if (visitedSymlinks.has(candidatePath)) {
-        const error = new Error(
-          `Too many symbolic links while resolving ${path}`,
-        ) as NodeJS.ErrnoException;
-        error.code = "ELOOP";
-        throw error;
-      }
-      visitedSymlinks.add(candidatePath);
 
       const linkTargetPath = resolve(
         dirname(candidatePath),
@@ -148,7 +138,7 @@ export async function resolveInCwd(path: string, cwd: string): Promise<{ absolut
   const resolved = await resolveTarget(absolute);
   return { absolute, resolved };
 }
-export async function writeAtomic(
+async function writeAtomicRaw(
   path: string,
   content: string,
   expectedIdentity?: FileIdentity,
@@ -231,5 +221,17 @@ export async function writeAtomic(
     }
     try { await rm(tempPath, { force: true }); } catch {}
     throw error;
+  }
+}
+export async function writeAtomic(
+  path: string,
+  content: string,
+  expectedIdentity?: FileIdentity,
+  restoreMode?: number,
+): Promise<void> {
+  try {
+    await writeAtomicRaw(path, content, expectedIdentity, restoreMode);
+  } catch (error) {
+    throw mapIoError(error, "write", path);
   }
 }

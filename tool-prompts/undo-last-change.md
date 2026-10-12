@@ -1,0 +1,1 @@
+Undo the last replace, replace_match, insert, copy, or move on a file, restoring the previous content, BOM, and line endings. If the file changed since that edit, the undo is refused and the file is left untouched; a file deleted since the edit is restored.

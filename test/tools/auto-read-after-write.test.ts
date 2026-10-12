@@ -309,7 +309,7 @@ describe("auto-read after write", () => {
 
       expect(autoReadText).toContain("line 1");
 
-      expect(autoReadText).toMatch(/offset=\d+/);
+      expect(autoReadText).toMatch(/offset=[A-Za-z]{4}/);
     } finally {
       await cleanupCwd(cwd);
     }
@@ -357,7 +357,7 @@ describe("auto-read after write", () => {
         {
           toolName: "replace",
           toolCallId: "replace-1",
-          input: { remove_from: "abc", remove_to: "abc", replacement_lines: ["BETA"] },
+          input: { remove_from: "abc", remove_to: "abc", text: ["BETA"] },
           content: [{ type: "text", text: "Successfully replaced in replace.txt. Added 1 line(s), removed 1 line(s)." }],
           details: { diff, metrics: { classification: "applied" } },
           isError: false,

@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { formatSize, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult } from "@earendil-works/pi-coding-agent";
+import { formatSize, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, createGrepToolDefinition, type TruncationResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, win32 } from "node:path";
@@ -11,14 +11,15 @@ import { globToRegex } from "./glob";
 import { MAX_HASH_LINES, fmtRow, HASH_LEN, HASH_SEP, HASH_CLASS } from "./hashline";
 import { ANCHOR_POOL_EXHAUSTED_PREFIX, MAX_GREP_LINE_BYTES } from "./constants";
 import { toCwd, toDisplayPath } from "./paths";
-import { loadP } from "./prompts";
+import { loadP, loadGuidelines } from "./prompts";
 import { normReq } from "./payload-contract";
 import { DEFAULT_EDIT_FLAGS, withGrepPrompts, type EditToolFlags } from "./edit-common";
-import { abortIf, clipLine, errCode, gutterWidth, isRec, makePrepareArguments, rejectUnknownFields, truncateToBytes, visLines } from "./utils";
+import { abortIf, clipLine, errCode, isRec, makePrepareArguments, rejectUnknownFields, truncateToBytes, visLines, gutterWidth } from "./utils";
 import { withAnchorSession, formatAnchorReclaimNotice, takeReclaimedPaths } from "./anchor-registry";
 import { serveRows } from "./served";
 import { Text } from "@earendil-works/pi-tui";
 import { expandHint, getResultText, reuseText, type CallT, type FgT } from "./replace-render";
+import { anchoredLine, grepResultSchema, withStructuredErrors, type GrepStructured } from "./structured";
 export const RG_TIMEOUT_MS = 10_000;
 
 const GREP_KS = new Set(["pattern", "path", "glob", "context", "ignoreCase", "literal", "limit"]);
@@ -65,104 +66,22 @@ function compileGrepGlob(glob: string): RegExp {
   }
 }
 
-function buildRegex(pattern: string, literal: boolean, ignoreCase: boolean): RegExp {
-  if (!literal) assertSafeRegex(pattern);
-  const source = literal ? pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : pattern;
+function regexSource(pattern: string, literal: boolean): string {
+  return literal ? pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : pattern;
+}
+
+function assertPattern(pattern: string, literal: boolean, ignoreCase: boolean): void {
   try {
-    return new RegExp(source, ignoreCase ? "ui" : "u");
+    new RegExp(regexSource(pattern, literal), ignoreCase ? "ui" : "u");
   } catch {
     throw new Error(`[E_BAD_SHAPE] Invalid pattern: ${pattern}`);
   }
 }
 
-interface RegexGroupRisk {
-  hasQuantifier: boolean;
-  hasAlternation: boolean;
-}
-
-function unsafeRegex(pattern: string): never {
-  throw new Error(
-    `[E_UNSAFE_REGEX] Refusing potentially exponential regex: ${pattern}. Use literal: true or simplify the expression.`,
-  );
-}
-
-function assertSafeRegex(pattern: string): void {
-  if (pattern.length > 4096) unsafeRegex(pattern);
-  const groups: RegexGroupRisk[] = [];
-  let inClass = false;
-  let escaped = false;
-  let variableQuantifiers = 0;
-  let lastAtom: { groupRisky: boolean; quantified: boolean } | undefined;
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i]!;
-    if (escaped) {
-      if (!inClass && (/[1-9]/.test(ch) || (ch === "k" && pattern[i + 1] === "<"))) {
-        unsafeRegex(pattern);
-      }
-      escaped = false;
-      lastAtom = { groupRisky: false, quantified: false };
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (inClass) {
-      if (ch === "]") {
-        inClass = false;
-        lastAtom = { groupRisky: false, quantified: false };
-      }
-      continue;
-    }
-    if (ch === "[") {
-      inClass = true;
-      continue;
-    }
-    if (ch === "(") {
-      groups.push({ hasQuantifier: false, hasAlternation: false });
-      lastAtom = undefined;
-      continue;
-    }
-    if (ch === ")") {
-      const group = groups.pop();
-      if (group) {
-        lastAtom = {
-          groupRisky: group.hasQuantifier || group.hasAlternation,
-          quantified: false,
-        };
-      }
-      continue;
-    }
-    if (ch === "|") {
-      const group = groups.at(-1);
-      if (group) group.hasAlternation = true;
-      lastAtom = undefined;
-      continue;
-    }
-    let quantifierLength = 0;
-    if (ch === "*" || ch === "+" || ch === "?") {
-      quantifierLength = 1;
-    } else if (ch === "{") {
-      quantifierLength = /^\{\d+(?:,\d*)?\}/.exec(pattern.slice(i))?.[0].length ?? 0;
-    }
-    if (ch === "{" && quantifierLength > 0) {
-      const quant = pattern.slice(i, i + quantifierLength);
-      const m = /^\{(\d+)/.exec(quant);
-      if (m && Number(m[1]) > 1000) unsafeRegex(pattern);
-    }
-    if (quantifierLength > 0 && lastAtom) {
-      if (ch === "?" && lastAtom.quantified) continue;
-      const variable = ch !== "{" || pattern.slice(i, i + quantifierLength).includes(",");
-      if (variable && ++variableQuantifiers > 1) unsafeRegex(pattern);
-      if (lastAtom.groupRisky) unsafeRegex(pattern);
-      const group = groups.at(-1);
-      if (group) group.hasQuantifier = true;
-      lastAtom.quantified = true;
-      i += quantifierLength - 1;
-      continue;
-    }
-    lastAtom = { groupRisky: false, quantified: false };
-  }
+interface RgMatchLine {
+  line: number;
+  start: number;
+  end: number;
 }
 
 interface FileHit {
@@ -176,6 +95,9 @@ interface FileHit {
   matchCount: number;
   totalMatchCount: number;
   fragmented: boolean[];
+  texts: string[];
+  matchLines: number[];
+  hadUtf8DecodeErrors: boolean;
 }
 
 const GREP_ROW_OVERHEAD_BYTES = HASH_LEN + Buffer.byteLength(HASH_SEP, "utf-8");
@@ -195,11 +117,23 @@ function snapCharBoundaries(line: string, start: number, end: number): [number, 
   return [s, e];
 }
 
-function grepMatchFragment(line: string, regex: RegExp): string {
-  const m = regex.exec(line);
-  const matchStart = m?.index ?? 0;
-  const matchLen = m?.[0].length ?? 0;
+function byteOffsetToCharIndex(line: string, byteOffset: number): number {
+  if (byteOffset <= 0) return 0;
+  let bytes = 0;
+  let index = 0;
+  for (const char of line) {
+    if (bytes >= byteOffset) return index;
+    const codePoint = char.codePointAt(0)!;
+    bytes += codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+    index += char.length;
+  }
+  return index;
+}
+
+function grepMatchFragment(line: string, startByte: number, endByte: number): string {
   const budget = GREP_ROW_CONTENT_BYTES - 6;
+  const matchStart = byteOffsetToCharIndex(line, startByte);
+  const matchLen = Math.max(0, byteOffsetToCharIndex(line, endByte) - matchStart);
   const half = Math.floor((budget - Math.min(matchLen, budget)) / 2);
   const [start, end] = snapCharBoundaries(line, Math.max(0, matchStart - half), Math.min(line.length, matchStart + matchLen + half));
   const content = truncateToBytes(line.slice(start, end), budget);
@@ -214,41 +148,46 @@ function grepHeadFragment(line: string): string {
 }
 
 function makeHitFromIndices(
-  norm: { normalized: string; fileHashes: string[]; absolutePath: string },
+  norm: { normalized: string; fileHashes: string[]; absolutePath: string; hadUtf8DecodeErrors: boolean },
   displayPath: string,
-  matchIndices: number[],
+  matches: RgMatchLine[],
   context: number,
-  regex: RegExp | undefined,
   totalMatchCount: number,
   keptMatchCount: number,
 ): FileHit {
   const lines = visLines(norm.normalized);
   const shown = new Set<number>();
-  const kept = matchIndices.slice(0, keptMatchCount);
-  for (const i of kept) {
-    for (let j = Math.max(0, i - context); j <= Math.min(lines.length - 1, i + context); j++) shown.add(j);
+  const kept = matches.slice(0, keptMatchCount);
+  for (const match of kept) {
+    const lineIndex = match.line - 1;
+    for (let j = Math.max(0, lineIndex - context); j <= Math.min(lines.length - 1, lineIndex + context); j++) shown.add(j);
   }
   const sorted = [...shown].sort((a, b) => a - b);
-  const matchSet = new Set(matchIndices);
+  const matchByLine = new Map<number, RgMatchLine>();
+  for (const match of matches) matchByLine.set(match.line - 1, match);
   const rows: string[] = [];
   const hashes: string[] = [];
   const lineNumbers: number[] = [];
   const fragmented: boolean[] = [];
+  const texts: string[] = [];
   for (const idx of sorted) {
     const hash = norm.fileHashes[idx]!;
     const line = lines[idx]!;
     const row = fmtRow(hash, line);
     if (Buffer.byteLength(row, "utf-8") > MAX_GREP_LINE_BYTES) {
-      const content = matchSet.has(idx) && regex ? grepMatchFragment(line, regex) : grepHeadFragment(line);
+      const match = matchByLine.get(idx);
+      const content = match !== undefined ? grepMatchFragment(line, match.start, match.end) : grepHeadFragment(line);
       rows.push(fmtRow(hash, content));
       hashes.push(hash);
       lineNumbers.push(idx + 1);
       fragmented.push(true);
+      texts.push(content);
     } else {
       rows.push(row);
       hashes.push(hash);
       lineNumbers.push(idx + 1);
       fragmented.push(false);
+      texts.push(line);
     }
   }
   return {
@@ -262,6 +201,9 @@ function makeHitFromIndices(
     matchCount: kept.length,
     totalMatchCount,
     fragmented,
+    texts,
+    matchLines: kept.map((match) => match.line),
+    hadUtf8DecodeErrors: norm.hadUtf8DecodeErrors,
   };
 }
 
@@ -320,7 +262,7 @@ async function collectRgMatches(
   req: GrepReq,
   signal: AbortSignal | undefined,
   repoRooted: boolean,
-): Promise<Map<string, number[]>> {
+): Promise<Map<string, RgMatchLine[]>> {
   const args = ["--json", "--line-number", "--color=never", "--hidden", "--glob", "!.git"];
   if (!repoRooted) args.push("--no-require-git");
   const wanted = req.limit ?? 100;
@@ -332,8 +274,8 @@ async function collectRgMatches(
   if (req.ignoreCase) args.push("--ignore-case");
   if (req.literal) args.push("--fixed-strings");
   args.push("--", pattern, searchPath);
-  const result = new Map<string, number[]>();
-  return await new Promise<Map<string, number[]>>((resolve, reject) => {
+  const result = new Map<string, RgMatchLine[]>();
+  return await new Promise<Map<string, RgMatchLine[]>>((resolve, reject) => {
     const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
     const rl = createInterface({ input: child.stdout });
     let stderr = "";
@@ -357,7 +299,7 @@ async function collectRgMatches(
     };
     rl.on("line", (line) => {
       if (!line.trim()) return;
-      let event: { type?: string; data?: { path?: { text?: string }; line_number?: number } };
+      let event: { type?: string; data?: { path?: { text?: string }; line_number?: number; submatches?: Array<{ start?: number; end?: number }> } };
       try {
         event = JSON.parse(line);
       } catch {
@@ -373,8 +315,11 @@ async function collectRgMatches(
           } catch {
             abs = filePath;
           }
+          const submatch = event.data?.submatches?.[0];
+          const start = typeof submatch?.start === "number" ? submatch.start : 0;
+          const end = typeof submatch?.end === "number" ? submatch.end : start;
           const list = result.get(abs) ?? [];
-          list.push(lineNumber);
+          list.push({ line: lineNumber, start, end });
           result.set(abs, list);
         }
       }
@@ -406,13 +351,11 @@ async function collectRgMatches(
 
 
 function displayRowsForHit(hit: FileHit): string[] {
-  let max = 0;
-  for (const n of hit.lineNumbers) if (n > max) max = n;
-  const width = gutterWidth(max, 1);
-  return hit.rows.map((row, i) => {
-    const n = hit.lineNumbers[i]!;
-    const padded = String(n).padStart(width, " ");
-    return `${padded} │ ${row}`;
+  const matched = new Set(hit.matchLines);
+  const width = gutterWidth(hit.lineNumbers.reduce((m, n) => (n > m ? n : m), 0), hit.lineNumbers.length);
+  return hit.rows.map((row, index) => {
+    const lineNumber = hit.lineNumbers[index]!;
+    return `${String(lineNumber).padStart(width)}${matched.has(lineNumber) ? ":" : "-"}${HASH_SEP} ${row}`;
   });
 }
 
@@ -470,7 +413,7 @@ export function fmtGrepCall(args: { pattern?: unknown; path?: unknown; glob?: un
   if (args?.ignoreCase === true) qualifiers.push("case-insensitive");
   if (typeof args?.context === "number") qualifiers.push(`context ${args.context}`);
   if (typeof args?.limit === "number") qualifiers.push(`limit ${args.limit}`);
-  let text = `${theme.fg("toolTitle", theme.bold("anchor_grep"))} ${pattern}`;
+  let text = `${theme.fg("toolTitle", theme.bold("grep"))} ${pattern}`;
   if (qualifiers.length > 0) text += ` ${theme.fg("dim", qualifiers.join(" "))}`;
   return text;
 }
@@ -478,8 +421,7 @@ export function fmtGrepCall(args: { pattern?: unknown; path?: unknown; glob?: un
 function highlightRegex(args: unknown): RegExp | undefined {
   if (!isRec(args) || typeof args.pattern !== "string" || args.pattern.length === 0) return undefined;
   try {
-    const validated = buildRegex(args.pattern, args.literal === true, args.ignoreCase === true);
-    return new RegExp(validated.source, validated.flags.includes("i") ? "giu" : "gu");
+    return new RegExp(regexSource(args.pattern, args.literal === true), args.ignoreCase === true ? "giu" : "gu");
   } catch {
     return undefined;
   }
@@ -499,6 +441,7 @@ function highlightMatches(text: string, regex: RegExp, theme: FgT): string {
 }
 
 const ANCHORED_ROW_RE = new RegExp(`^${HASH_CLASS}${HASH_SEP}`);
+const GREP_GUTTER_RE = /^\s*\d+(?: │ |[:-]│ )/;
 
 function highlightHitRow(row: string, highlight: RegExp, theme: FgT): string {
   const anchored = row.match(ANCHORED_ROW_RE);
@@ -510,9 +453,9 @@ function styleGrepLine(line: string, highlight: RegExp | undefined, theme: FgT):
   if (line.startsWith("=== ")) return theme.fg("accent", line);
   if (line.startsWith("[grep:") || line.startsWith("... ")) return theme.fg("dim", line);
   if (!highlight) return line;
-  const gutter = line.indexOf(" │ ");
-  if (gutter < 0) return highlightHitRow(line, highlight, theme);
-  const cut = gutter + " │ ".length;
+  const gutter = GREP_GUTTER_RE.exec(line);
+  if (gutter === null) return highlightHitRow(line, highlight, theme);
+  const cut = gutter[0].length;
   return line.slice(0, cut) + highlightHitRow(line.slice(cut), highlight, theme);
 }
 
@@ -531,14 +474,20 @@ export function renderGrepResult(result: { content?: Array<{ type: string; text?
   return reuseText(context, shown.join("\n"));
 }
 export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FLAGS): void {
-  const prompted = withGrepPrompts({ description: loadP("../prompts/grep.md"), snippet: loadP("../prompts/grep-snippet.md") }, flags);
+  const prompted = withGrepPrompts({
+    description: loadP("../tool-prompts/grep.md"),
+    snippet: loadP("../tool-prompts/grep-snippet.md"),
+    guidelines: loadGuidelines("../tool-prompts/grep-guidelines.md"),
+  }, flags);
   pi.registerTool({
-    name: "anchor_grep",
-    label: "Anchor Grep",
+    name: "grep",
+    label: "Grep",
     description: prompted.description,
     promptSnippet: prompted.snippet,
+    promptGuidelines: prompted.guidelines,
     prepareArguments: makePrepareArguments(),
     parameters: grepToolSchema,
+    outputSchema: grepResultSchema,
     executionMode: "sequential",
     renderCall(args: any, theme: CallT, context: any) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
@@ -550,7 +499,7 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
     },
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      return withAnchorSession(ctx, async () => {
+      return withStructuredErrors(signal, {}, () => withAnchorSession(ctx, async () => {
         const canonical = normReq(params);
         assertGrepReq(canonical);
         const req = canonical;
@@ -575,7 +524,7 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
           const globPath = toDisplayPath(globRoot, absPath);
           return globRegex.test(globPath) || globRegex.test(displayPath);
         };
-        const validatedRegex = buildRegex(req.pattern, req.literal === true, req.ignoreCase === true);
+        assertPattern(req.pattern, req.literal === true, req.ignoreCase === true);
         const rgPath = await resolveRgPath();
         const hits: FileHit[] = [];
         let matches = 0;
@@ -606,15 +555,13 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
         for (let f = 0; f < sortedFiles.length; f++) {
           abortIf(signal);
           const absPath = sortedFiles[f]!;
-          const allNums = rgMatches.get(absPath) ?? [];
-          const totalForFile = allNums.length;
-          const sortedNums = [...allNums].sort((a, b) => a - b);
-          const indices = sortedNums.map((n) => n - 1).filter((n) => n >= 0);
+          const fileMatches = [...(rgMatches.get(absPath) ?? [])].sort((a, b) => a.line - b.line);
+          const totalForFile = fileMatches.length;
           if (countOnly) {
             if (!matchesGlob(absPath)) continue;
             const norm = await readGrepFileShadow(absPath);
             if (!norm) continue;
-            const hit = makeHitFromIndices(norm, toDisplayPath(ctx.cwd, absPath), indices, context, validatedRegex, totalForFile, indices.length);
+            const hit = makeHitFromIndices(norm, toDisplayPath(ctx.cwd, absPath), fileMatches, context, totalForFile, fileMatches.length);
             const display = displayRowsForHit(hit);
             totalRows += display.length;
             for (const r of display) totalBytes += Buffer.byteLength(r, "utf-8") + 1;
@@ -636,12 +583,13 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
           if (!matchesGlob(absPath)) continue;
           const norm = await readGrepFile(absPath);
           if (!norm) continue;
-          const hit = makeHitFromIndices(norm, toDisplayPath(ctx.cwd, absPath), indices, context, validatedRegex, totalForFile, Math.min(totalForFile, remaining));
+          const hit = makeHitFromIndices(norm, toDisplayPath(ctx.cwd, absPath), fileMatches, context, totalForFile, Math.min(totalForFile, remaining));
           const display = displayRowsForHit(hit);
           const keptRows: string[] = [];
           const keptHashes: string[] = [];
           const keptLineNumbers: number[] = [];
           const keptFragmented: boolean[] = [];
+          const keptTexts: string[] = [];
           for (let i = 0; i < display.length; i++) {
             const row = display[i]!;
             const rowBytes = Buffer.byteLength(row, "utf-8") + 1;
@@ -658,6 +606,7 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
             keptHashes.push(hit.hashes[i]!);
             keptLineNumbers.push(hit.lineNumbers[i]!);
             keptFragmented.push(hit.fragmented[i]!);
+            keptTexts.push(hit.texts[i]!);
             if (hit.fragmented[i]) linesReplaced += 1;
             rowCount += 1;
             byteCount += rowBytes;
@@ -666,7 +615,7 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
           }
           if (hit.totalMatchCount > hit.matchCount) limitTruncated = true;
           matches += hit.matchCount;
-          const displayHit: FileHit = { ...hit, rows: keptRows, hashes: keptHashes, lineNumbers: keptLineNumbers, fragmented: keptFragmented };
+          const displayHit: FileHit = { ...hit, rows: keptRows, hashes: keptHashes, lineNumbers: keptLineNumbers, fragmented: keptFragmented, texts: keptTexts };
           hits.push(displayHit);
           if (rowTruncated) countOnly = true;
         }
@@ -684,6 +633,7 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
         if (limitTruncated) notes.push(`[grep: showing first ${limit} matches; increase limit to see more.]`);
         if (linesReplaced > 0) notes.push(`[grep: ${linesReplaced} line(s) exceed ${formatSize(MAX_GREP_LINE_BYTES)} and are shown as truncated fragments; use read to see the full lines.]`);
         if (poolSkipped > 0) notes.push(`[grep: ${poolSkipped} file(s) skipped because the session's anchor pool is exhausted; narrow the search.]`);
+        if (context > 0 && hits.length > 0) notes.push('[grep: match rows are "line:│", context rows are "line-│".]');
         const truncated = limitTruncated || rowTruncated;
         const truncation: TruncationResult | undefined = rowTruncated
           ? {
@@ -705,6 +655,20 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
           : notes.length > 0
             ? `No matches found.\n${notes.join("\n")}`
             : "No matches found.";
+        const structuredContent: GrepStructured = {
+          ok: true,
+          kind: "grep",
+          text,
+          matches,
+          files: hits.length,
+          truncated,
+          results: hits.map((hit) => ({
+            path: hit.displayPath,
+            matchLines: [...hit.matchLines],
+            lines: hit.hashes.map((anchor, index) => anchoredLine(hit.lineNumbers[index]!, hit.texts[index]!, anchor)),
+            hadUtf8DecodeErrors: hit.hadUtf8DecodeErrors,
+          })),
+        };
         return {
           content: [{ type: "text", text }],
           details: {
@@ -716,8 +680,13 @@ export function regGrep(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
               truncated,
             },
           },
+          structuredContent,
         };
-      });
+      }));
     },
   });
+}
+
+export function regVanillaGrep(pi: ExtensionAPI, cwd: string): void {
+  pi.registerTool(createGrepToolDefinition(cwd));
 }

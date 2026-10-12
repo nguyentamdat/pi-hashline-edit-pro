@@ -1,17 +1,19 @@
 import { readFile } from "node:fs/promises";
 import type { PipelineResult } from "./replace";
-import { abortIf, assertByteLimit, errCode, splitLines } from "./utils";
+import { abortIf, assertByteLimit, errCode, mapIoError, splitLines } from "./utils";
 import { buildChanged, buildNoop, type RMeta, type TResult } from "./replace-response";
 import { saveUndo } from "./replace-undo";
 import { getDiffContextLines } from "./config";
 import { safeSnapId } from "./file-reader";
 import { writeAtomic } from "./fs-write";
-import { formatAnchorReclaimNotice, takeReclaimedPaths } from "./anchor-registry";
+import { formatAnchorReclaimNotice, servedForPath, takeReclaimedPaths } from "./anchor-registry";
 import { servedHashesFromDiff, serveRows } from "./served";
+import { recordPreEditSnapshot } from "./pre-edit-snapshot";
 import { lineHashes } from "./hashline";
 import { spanForEdit } from "./replace";
 import { restoreEndings, stripBOM, toLF, type LineEnding } from "./normalize";
 import { applyEndingOverrides, joinSeparators, separatorsForSpans } from "./line-endings";
+import { toEditVerb } from "./structured";
 export interface CommitMeta {
   editAnchors?: [string, string];
   anchorCarry?: number;
@@ -36,7 +38,7 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
   const span = pipe.spans?.[0] ?? (meta.editAnchors ? spanForEdit(pipe.originalHashes, meta.editAnchors[0], meta.editAnchors[1], pipe.result) : undefined);
   if (span && meta.anchorCarry !== undefined) span.carry = meta.anchorCarry;
   const resultSeparators = span
-    ? separatorsForSpans(pipe.originalSeparators, pipe.originalHashes.length, [span], pipe.result, pipe.originalEnding)
+    ? separatorsForSpans(pipe.originalSeparators, pipe.originalHashes.length, [span], pipe.result, pipe.originalEnding, splitLines(pipe.originalNormalized))
     : undefined;
   if (resultSeparators !== undefined && span !== undefined) {
     applyEndingOverrides(resultSeparators, span.start, pipe.contentSeparators);
@@ -62,10 +64,24 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
           removedLines: 0,
         },
         warnings,
+        verb: toEditVerb(meta.verb),
       },
       meta.noopNoun,
     );
   }
+
+  const served = servedForPath(mutationTargetPath);
+  recordPreEditSnapshot({
+    absolutePath: mutationTargetPath,
+    normalized: pipe.originalNormalized,
+    bom: pipe.bom,
+    originalEnding: pipe.originalEnding,
+    endingSeparators: pipe.originalSeparators,
+    fileHashes: pipe.originalHashes,
+    hadUtf8DecodeErrors: pipe.hadUtf8DecodeErrors,
+    identity: pipe.identity,
+    served: served ? new Map(served) : undefined,
+  });
 
   assertByteLimit(finalFileBytes, path);
 
@@ -84,7 +100,7 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     if (code === "ENOENT") currentRaw = undefined;
     else if (code === "EACCES" || code === "EPERM") throw new Error(`[E_ACCESS] File is not readable: ${path}`);
     else if (code === "ELOOP") throw new Error(`[E_ACCESS] Too many symbolic links while resolving: ${path}`);
-    else throw error;
+    else throw mapIoError(error, "read", path);
   }
   if (currentRaw === undefined) {
     throw new Error(`[E_OP_ABORTED] Edit aborted: the file was deleted after the edit started.`);
@@ -153,8 +169,10 @@ export async function commitEdit(pipe: PipelineResult, meta: CommitMeta): Promis
     ...(span ? { spans: [span] } : {}),
   };
   const changed = buildChanged(successInput, meta.verb, await getDiffContextLines());
-  if (changed.details.diff) {
-    serveRows(mutationTargetPath, resultHashes, splitLines(pipe.result), servedHashesFromDiff(changed.details.diff));
+  if (changed.details.diff || pipe.result.length === 0) {
+    const wanted = servedHashesFromDiff(changed.details.diff);
+    if (pipe.result.length === 0) wanted.push(...resultHashes);
+    serveRows(mutationTargetPath, resultHashes, splitLines(pipe.result), wanted);
   }
   return changed;
 }

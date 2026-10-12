@@ -2,16 +2,22 @@ import { describe, expect, it } from "vitest";
 import {
   toggleAutoRead,
   cycleAutoReadAllMode,
+  toggleAutoReadAllRequireGit,
   toggleAnchorGrep,
   toggleCopyMove,
-  toggleReplaceWithin,
+  toggleReplaceMatch,
+  cycleReadOnDisabledModels,
   toggleRequirePath,
   toggleStrictInput,
   adjustDiffContextLines,
   readConfig,
   readConfigWithStatus,
   writeConfig,
+  parseDisableOnModels,
+  setDisableOnModels,
+  setDisableOnModelsFromText,
 } from "../../src/config";
+import { configRows } from "../../src/config-ui";
 import { configPath } from "../../src/paths";
 import { stat } from "fs/promises";
 import { withTempDir } from "../support/fixtures";
@@ -105,28 +111,28 @@ describe("config - toggleCopyMove", () => {
   });
 });
 
-describe("config - toggleReplaceWithin", () => {
+describe("config - toggleReplaceMatch", () => {
   it("toggles from default true to false", async () => {
     await withTempDir("pi-hashline-config-test-", async () => {
-      expect(await toggleReplaceWithin()).toBe(false);
-      expect((await readConfig()).replaceWithinEnabled).toBe(false);
+      expect(await toggleReplaceMatch()).toBe(false);
+      expect((await readConfig()).replaceMatchEnabled).toBe(false);
     });
   });
 
   it("toggles from false back to true", async () => {
     await withTempDir("pi-hashline-config-test-", async () => {
-      await writeConfig({ autoRead: true, anchorGrepEnabled: true, replaceWithinEnabled: false });
-      expect(await toggleReplaceWithin()).toBe(true);
-      expect((await readConfig()).replaceWithinEnabled).toBe(true);
+      await writeConfig({ autoRead: true, anchorGrepEnabled: true, replaceMatchEnabled: false });
+      expect(await toggleReplaceMatch()).toBe(true);
+      expect((await readConfig()).replaceMatchEnabled).toBe(true);
     });
   });
 
   it("round-trips correctly through multiple toggles", async () => {
     await withTempDir("pi-hashline-config-test-", async () => {
-      expect(await toggleReplaceWithin()).toBe(false);
-      expect(await toggleReplaceWithin()).toBe(true);
-      expect(await toggleReplaceWithin()).toBe(false);
-      expect((await readConfig()).replaceWithinEnabled).toBe(false);
+      expect(await toggleReplaceMatch()).toBe(false);
+      expect(await toggleReplaceMatch()).toBe(true);
+      expect(await toggleReplaceMatch()).toBe(false);
+      expect((await readConfig()).replaceMatchEnabled).toBe(false);
     });
   });
 });
@@ -138,21 +144,33 @@ describe("config - cycleAutoReadAllMode", () => {
     });
   });
 
-  it("cycles off to on to git and back to off", async () => {
+  it("cycles off to outline to full and back to off", async () => {
     await withTempDir("pi-hashline-config-test-", async () => {
-      expect(await cycleAutoReadAllMode()).toBe("on");
-      expect((await readConfig()).autoReadAll).toBe("on");
-      expect(await cycleAutoReadAllMode()).toBe("git");
-      expect((await readConfig()).autoReadAll).toBe("git");
+      expect(await cycleAutoReadAllMode()).toBe("outline");
+      expect((await readConfig()).autoReadAll).toBe("outline");
+      expect(await cycleAutoReadAllMode()).toBe("full");
+      expect((await readConfig()).autoReadAll).toBe("full");
       expect(await cycleAutoReadAllMode()).toBe("off");
       expect((await readConfig()).autoReadAll).toBe("off");
     });
   });
 
-  it("reads the mode from the config file", async () => {
-    await withTempDir("pi-hashline-config-test-", async () => {
-      await writeConfig({ autoRead: true, anchorGrepEnabled: true, autoReadAll: "git" });
-      expect((await readConfig()).autoReadAll).toBe("git");
+  it("reads the mode from the config file and maps legacy git modes", async () => {
+    await withTempDir("pi-hashline-config-test-", async (dir) => {
+      const { writeFile, mkdir } = await import("fs/promises");
+      const { join: pathJoin } = await import("path");
+      const configDir = pathJoin(dir, ".config", "pi-hashline-edit-pro");
+      await mkdir(configDir, { recursive: true });
+      await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, anchorGrepEnabled: true, autoReadAll: "git" }));
+      const legacyGit = await readConfig();
+      expect(legacyGit.autoReadAll).toBe("full");
+      expect(legacyGit.autoReadAllRequireGit).toBe(true);
+      await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, anchorGrepEnabled: true, autoReadAll: "outline(git)" }));
+      const legacyOutlineGit = await readConfig();
+      expect(legacyOutlineGit.autoReadAll).toBe("outline");
+      expect(legacyOutlineGit.autoReadAllRequireGit).toBe(true);
+      await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, anchorGrepEnabled: true, autoReadAll: "full" }));
+      expect((await readConfig()).autoReadAllRequireGit).toBe(false);
     });
   });
 
@@ -163,7 +181,31 @@ describe("config - cycleAutoReadAllMode", () => {
       const configDir = pathJoin(dir, ".config", "pi-hashline-edit-pro");
       await mkdir(configDir, { recursive: true });
       await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, autoReadAll: true }));
-      expect((await readConfig()).autoReadAll).toBe("on");
+      const legacyTrue = await readConfig();
+      expect(legacyTrue.autoReadAll).toBe("full");
+      expect(legacyTrue.autoReadAllRequireGit).toBe(false);
+      await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, autoReadAll: "on" }));
+      const legacyOn = await readConfig();
+      expect(legacyOn.autoReadAll).toBe("full");
+      expect(legacyOn.autoReadAllRequireGit).toBe(false);
+    });
+  });
+});
+
+describe("config - toggleAutoReadAllRequireGit", () => {
+  it("defaults to true and toggles to false", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect((await readConfig()).autoReadAllRequireGit).toBe(true);
+      expect(await toggleAutoReadAllRequireGit()).toBe(false);
+      expect((await readConfig()).autoReadAllRequireGit).toBe(false);
+    });
+  });
+
+  it("toggles from false back to true", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      await writeConfig({ autoRead: true, anchorGrepEnabled: true, autoReadAllRequireGit: false });
+      expect(await toggleAutoReadAllRequireGit()).toBe(true);
+      expect((await readConfig()).autoReadAllRequireGit).toBe(true);
     });
   });
 });
@@ -252,9 +294,9 @@ describe("config - readConfig defaults", () => {
     });
   });
 
-  it("defaults replaceWithinEnabled to true when no config file exists", async () => {
+  it("defaults replaceMatchEnabled to true when no config file exists", async () => {
     await withTempDir("pi-hashline-config-test-", async () => {
-      expect((await readConfig()).replaceWithinEnabled).toBe(true);
+      expect((await readConfig()).replaceMatchEnabled).toBe(true);
     });
   });
 
@@ -368,6 +410,95 @@ describe("config - diffContextLines", () => {
       expect(await adjustDiffContextLines(-5)).toBe(0);
       expect(await adjustDiffContextLines(50)).toBe(10);
       expect((await readConfig()).diffContextLines).toBe(10);
+    });
+  });
+});
+
+describe("config - disableOnModels", () => {
+  it("defaults to an empty list", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect((await readConfig()).disableOnModels).toEqual([]);
+    });
+  });
+
+  it("parses arrays and comma-separated strings with trimming and dedupe", () => {
+    expect(parseDisableOnModels([" OpenAI/* ", "openai/*", "", 42])).toEqual(["OpenAI/*"]);
+    expect(parseDisableOnModels("openai/*, *gpt*,, *GPT*")).toEqual(["openai/*", "*gpt*"]);
+    expect(parseDisableOnModels(undefined)).toEqual([]);
+    expect(parseDisableOnModels(42)).toEqual([]);
+  });
+
+  it("persists globs through setDisableOnModels and its text form", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect(await setDisableOnModels([" openai/* ", "openai/*"])).toEqual(["openai/*"]);
+      expect((await readConfig()).disableOnModels).toEqual(["openai/*"]);
+      expect(await setDisableOnModelsFromText("*gpt*, openai/*")).toEqual(["*gpt*", "openai/*"]);
+      expect((await readConfig()).disableOnModels).toEqual(["*gpt*", "openai/*"]);
+    });
+  });
+
+  it("exposes the disable row with its globs", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      await setDisableOnModels([]);
+      const empty = configRows(await readConfig()).find((row) => row.key === "disableOnModels")!;
+      expect(empty.label).toBe("Disable on models");
+      expect(empty.entries).toEqual([]);
+      expect(empty.enabled).toBe(false);
+      await setDisableOnModels(["openai/*"]);
+      const filled = configRows(await readConfig()).find((row) => row.key === "disableOnModels")!;
+      expect(filled.entries).toEqual(["openai/*"]);
+      expect(filled.enabled).toBe(true);
+    });
+  });
+});
+
+describe("config - readOnDisabledModels", () => {
+  it("defaults to vanilla when no config file exists", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect((await readConfig()).readOnDisabledModels).toBe("vanilla");
+    });
+  });
+
+  it("reads a stored value", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      await writeConfig({ autoRead: true, anchorGrepEnabled: true, readOnDisabledModels: "remove" });
+      expect((await readConfig()).readOnDisabledModels).toBe("remove");
+    });
+  });
+
+  it("cycles the policy", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      expect(await cycleReadOnDisabledModels()).toBe("remove");
+      expect((await readConfig()).readOnDisabledModels).toBe("remove");
+      expect(await cycleReadOnDisabledModels()).toBe("vanilla");
+      expect((await readConfig()).readOnDisabledModels).toBe("vanilla");
+    });
+  });
+
+  it("migrates the legacy disableReadOnModels boolean", async () => {
+    await withTempDir("pi-hashline-config-test-", async (dir) => {
+      const { writeFile, mkdir } = await import("fs/promises");
+      const { join: pathJoin } = await import("path");
+      const configDir = pathJoin(dir, ".config", "pi-hashline-edit-pro");
+      await mkdir(configDir, { recursive: true });
+      await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, disableReadOnModels: false }));
+      expect((await readConfig()).readOnDisabledModels).toBe("vanilla");
+      await writeFile(pathJoin(configDir, "config.json"), JSON.stringify({ autoRead: true, disableReadOnModels: true }));
+      expect((await readConfig()).readOnDisabledModels).toBe("remove");
+    });
+  });
+
+  it("exposes the row and follows the stored value", async () => {
+    await withTempDir("pi-hashline-config-test-", async () => {
+      const vanilla = configRows(await readConfig()).find((row) => row.key === "readOnDisabledModels")!;
+      expect(vanilla.label).toBe("Read on disabled models");
+      expect(vanilla.mode).toBe("vanilla");
+      expect(vanilla.enabled).toBe(true);
+      expect(vanilla.cycle).toEqual(["remove", "vanilla"]);
+      await writeConfig({ autoRead: true, anchorGrepEnabled: true, readOnDisabledModels: "remove" });
+      const remove = configRows(await readConfig()).find((row) => row.key === "readOnDisabledModels")!;
+      expect(remove.mode).toBe("remove");
+      expect(remove.enabled).toBe(false);
     });
   });
 });

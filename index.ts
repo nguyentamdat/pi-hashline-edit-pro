@@ -1,31 +1,36 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { createReadToolDefinition, createGrepToolDefinition, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { initHasher } from "./src/hashline";
-import { regReplaceWithin } from "./src/replace-within";
+import { regReplaceMatch } from "./src/replace-match";
 import { regReplace } from "./src/replace";
 import { regInsert } from "./src/insert";
 import { regCopy, regMove } from "./src/copy-move";
-import { regGrep } from "./src/grep";
+import { regGrep, regVanillaGrep } from "./src/grep";
 import { regUndo, clearUndo } from "./src/replace-undo";
 import { regRead, fmtReadPreview } from "./src/read";
-import { buildAutoReadAllInjection, autoReadAllBudget } from "./src/auto-read-all";
-import { clearAutoReadAllComplete } from "./src/auto-read-all-state";
+import { ANCHOR_TOOL_NAMES, modelDisabled, type ModelLike } from "./src/model-gate";
+import { buildAutoReadAllInjection, autoReadAllBudget, isOutlineAutoReadAll } from "./src/auto-read-all";
 import type { RMetrics } from "./src/replace-response";
 import type { ReplaceDetails } from "./src/replace";
 import { extractHints, extractWarnings } from "./src/replace-render";
 import { MAX_HASH_LINES } from "./src/hashline";
-import type { AutoReadAllMode } from "./src/config";
+import { withStructuredText } from "./src/structured";
+import type { AutoReadAllMode, ReadOnDisabledModels } from "./src/config";
 import {
+  readConfig,
   readConfigWithStatus,
   toggleAutoRead,
   cycleAutoReadAllMode,
+  toggleAutoReadAllRequireGit,
   toggleAnchorGrep,
   toggleCopyMove,
-  toggleReplaceWithin,
+  toggleReplaceMatch,
+  cycleReadOnDisabledModels,
   toggleRequirePath,
   toggleStrictInput,
   adjustDiffContextLines,
   setAutoReadAllIgnoreFromText,
+  setDisableOnModelsFromText,
 } from "./src/config";
 import { loadHashStore, pruneMissing } from "./src/hash-store";
 import { initRegistry, gcRegistrySidecars, clearRegistry, freeAnchors, sessionKeyFor, withAnchorSession, releaseRegistrySession, formatAnchorReclaimNotice, takeReclaimedPaths } from "./src/anchor-registry";
@@ -45,39 +50,106 @@ export default function (pi: ExtensionAPI): void {
   regRead(pi);
 
   regReplace(pi);
-  regReplaceWithin(pi);
+  regReplaceMatch(pi);
   regInsert(pi);
   regCopy(pi);
   regMove(pi);
   regGrep(pi);
   regUndo(pi);
-  registerWriteHook(pi);
+  registerWriteHook(pi, (model) => modelDisabled(model, disableOnModels));
 
   let autoRead = true;
   let autoReadAll: AutoReadAllMode = "off";
   let autoReadAllIgnore: string[] = [];
+  let autoReadAllRequireGit = true;
+  let disableOnModels: string[] = [];
+  let readOnDisabledModels: ReadOnDisabledModels = "vanilla";
+  let readFlavor: "anchored" | "vanilla" = "anchored";
+  let readFlavorCwd: string | undefined;
   let autoReadAllInjected = false;
-  let grepWasActive = false;
+  let grepEnabled = true;
+  let grepFlavor: "anchored" | "vanilla" = "anchored";
+  let grepFlavorCwd: string | undefined;
+  const baseAnchorTools = new Set<string>();
+  let gateApplied = false;
 
   async function refreshEditTools(): Promise<void> {
     try {
-      const flags = await currentEditFlags();
-      regRead(pi, flags);
+      const flags = await currentEditFlags(pi.getActiveTools().includes("codemode"));
+      if (readFlavor !== "vanilla") regRead(pi, flags);
       regReplace(pi, flags);
-      regReplaceWithin(pi, flags);
+      regReplaceMatch(pi, flags);
       regInsert(pi, flags);
       regCopy(pi, flags);
       regMove(pi, flags);
-      regGrep(pi, flags);
+      if (grepFlavor === "vanilla" && grepFlavorCwd !== undefined) regVanillaGrep(pi, grepFlavorCwd);
+      else regGrep(pi, flags);
       regUndo(pi, flags);
     } catch (error) {
       console.error("Failed to refresh edit tools:", error);
     }
   }
 
+  async function syncModelGate(model: ModelLike | undefined, cwd: string): Promise<void> {
+    const gated = disableOnModels.length > 0 && modelDisabled(model, disableOnModels);
+    if (gated && readOnDisabledModels === "vanilla") {
+      if (readFlavor !== "vanilla" || readFlavorCwd !== cwd) {
+        pi.registerTool(createReadToolDefinition(cwd));
+        readFlavor = "vanilla";
+        readFlavorCwd = cwd;
+      }
+    } else if (readFlavor === "vanilla") {
+      readFlavor = "anchored";
+      readFlavorCwd = undefined;
+      await refreshEditTools();
+    }
+    const grepFlavorWanted = grepEnabled && !gated ? "anchored" : "vanilla";
+    if (grepFlavorWanted === "vanilla") {
+      if (grepFlavor !== "vanilla" || grepFlavorCwd !== cwd) {
+        pi.registerTool(createGrepToolDefinition(cwd));
+        grepFlavor = "vanilla";
+        grepFlavorCwd = cwd;
+      }
+    } else if (grepFlavor === "vanilla") {
+      grepFlavor = "anchored";
+      grepFlavorCwd = undefined;
+      await refreshEditTools();
+    }
+    if (gated) {
+      const active = pi.getActiveTools().filter((tool) => tool !== "edit");
+      const gatedTools = ANCHOR_TOOL_NAMES.filter((tool) => tool !== "grep" && (readOnDisabledModels !== "vanilla" || tool !== "read"));
+      const next = active.filter((tool) => !gatedTools.includes(tool));
+      pi.setActiveTools(next);
+      gateApplied = true;
+      return;
+    }
+    if (!gateApplied) {
+      const current = pi.getActiveTools();
+      const withoutEdit = current.filter((tool) => tool !== "edit");
+      if (withoutEdit.length !== current.length) pi.setActiveTools(withoutEdit);
+      return;
+    }
+    gateApplied = false;
+    const config = await readConfig();
+    const enabled = ANCHOR_TOOL_NAMES.filter((tool) => {
+      if (tool === "read") return true;
+      if (!baseAnchorTools.has(tool)) return false;
+      if (tool === "replace_match") return config.replaceMatchEnabled !== false;
+      if (tool === "copy" || tool === "move") return config.copyMoveEnabled !== false;
+      if (tool === "grep") return config.anchorGrepEnabled === true;
+      return true;
+    });
+    const active = pi.getActiveTools().filter((tool) => tool !== "edit");
+    const base = enabled.includes("grep") ? active.filter((tool) => tool !== "grep") : active;
+    pi.setActiveTools([...new Set([...base, ...enabled])]);
+  }
+
   pi.on("session_start", async (_event, ctx) => withAnchorSession(ctx, async () => {
     const active = pi.getActiveTools();
-    grepWasActive = active.includes("grep");
+    baseAnchorTools.clear();
+    for (const tool of ANCHOR_TOOL_NAMES) {
+      if (active.includes(tool)) baseAnchorTools.add(tool);
+    }
     pi.setActiveTools(active.filter((t) => t !== "edit"));
     await initHasher();
     loadHashStore()
@@ -96,18 +168,24 @@ export default function (pi: ExtensionAPI): void {
     if (corrupted && (ctx as { hasUI?: boolean }).hasUI) ctx.ui.notify("Hashline config was corrupt and was reset to defaults", "warning");
     autoRead = config.autoRead;
     autoReadAll = config.autoReadAll ?? "off";
+    autoReadAllRequireGit = config.autoReadAllRequireGit ?? true;
     autoReadAllIgnore = config.autoReadAllIgnore ?? [];
+    disableOnModels = config.disableOnModels ?? [];
+    readOnDisabledModels = config.readOnDisabledModels ?? "vanilla";
+    grepEnabled = config.anchorGrepEnabled === true;
+    grepFlavor = grepEnabled ? "anchored" : "vanilla";
+    grepFlavorCwd = grepEnabled ? undefined : ctx.cwd;
     const sessionBranch = (ctx as { sessionManager?: { getBranch?: () => Array<{ type?: string; customType?: string }> } }).sessionManager?.getBranch?.() ?? [];
     autoReadAllInjected = sessionBranch.some((entry) => entry.type === "custom_message" && entry.customType === AUTO_READ_ALL_CUSTOM_TYPE);
     await refreshEditTools();
     pi.setActiveTools(
       pi.getActiveTools().filter((t) => {
-        if (config.anchorGrepEnabled ? t === "grep" : t === "anchor_grep") return false;
         if (config.copyMoveEnabled === false && (t === "copy" || t === "move")) return false;
-        if (config.replaceWithinEnabled === false && t === "replace_within") return false;
+        if (config.replaceMatchEnabled === false && t === "replace_match") return false;
         return true;
       }),
     );
+    await syncModelGate(ctx.model, ctx.cwd);
     const debugValue = process.env.PI_HASHLINE_DEBUG;
     if (debugValue === "1" || debugValue === "true") {
       ctx.ui.notify(`Hashline Edit mode active`, "info");
@@ -117,20 +195,24 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (_event, ctx) => {
     try {
       const key = sessionKeyFor(ctx);
-      clearAutoReadAllComplete(key);
       if (key !== undefined) releaseRegistrySession(key);
     } catch (error) {
       console.error("Failed to release anchor registry session:", error);
     }
   });
+  pi.on("model_select", async (event, ctx) => withAnchorSession(ctx, async () => {
+    await syncModelGate(event.model, ctx.cwd);
+  }));
 
   pi.on("before_agent_start", async (_event, ctx) => withAnchorSession(ctx, async () => {
+    await syncModelGate(ctx.model, ctx.cwd);
     if (autoReadAll === "off" || autoReadAllInjected) return;
+    if (modelDisabled(ctx.model, disableOnModels)) return;
     autoReadAllInjected = true;
     try {
-      const injection = await buildAutoReadAllInjection(ctx.cwd, autoReadAllBudget(ctx.model), autoReadAll, autoReadAllIgnore, sessionKeyFor(ctx));
+      const injection = await buildAutoReadAllInjection(ctx.cwd, autoReadAllBudget(ctx.model), autoReadAll, autoReadAllIgnore, autoReadAllRequireGit);
       if (!injection) return;
-      if (ctx.hasUI) ctx.ui.notify(`Auto-read all: attached ${injection.files} file(s) with anchors`, "info");
+      if (ctx.hasUI) ctx.ui.notify(`Auto-read all: ${isOutlineAutoReadAll(autoReadAll) ? "outlined" : "attached"} ${injection.files} file(s)`, "info");
       return { message: { customType: AUTO_READ_ALL_CUSTOM_TYPE, content: injection.text, display: false } };
     } catch (error) {
       console.error("Auto-read all failed:", error);
@@ -139,7 +221,7 @@ export default function (pi: ExtensionAPI): void {
   }));
 
   pi.registerCommand("hashline-config", {
-    description: "Open the hashline settings window (auto-read, auto-read all, ignore folders/files, diff context, grep, copy/move, replace_within, path, strict input)",
+    description: "Open the hashline settings window (auto-read, diff context, auto-read all, git repos only, ignore folders/files, grep, copy/move, replace_match, path, strict input, disable on models, read on disabled models)",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("/hashline-config requires interactive mode", "error");
@@ -148,31 +230,45 @@ export default function (pi: ExtensionAPI): void {
       await ctx.ui.custom<void>(async (tui, theme, _keybindings, done) => {
         const overlay = new HashlineConfigOverlay({
           tui,
+          maxHeight: () => tui.terminal ? Math.max(6, Math.floor(tui.terminal.rows * 0.9)) : undefined,
           theme,
           done,
           onToggle: async (key, delta, value) => {
             if (key === "autoRead") autoRead = await toggleAutoRead();
-            else if (key === "autoReadAll") { autoReadAll = await cycleAutoReadAllMode(); autoReadAllInjected = false; }
+            else if (key === "autoReadAll") { autoReadAll = await cycleAutoReadAllMode(delta); autoReadAllInjected = false; }
+            else if (key === "autoReadAllRequireGit") autoReadAllRequireGit = await toggleAutoReadAllRequireGit();
             else if (key === "autoReadAllIgnore") autoReadAllIgnore = await setAutoReadAllIgnoreFromText(value ?? "");
+            else if (key === "disableOnModels") disableOnModels = await setDisableOnModelsFromText(value ?? "");
+            else if (key === "readOnDisabledModels") readOnDisabledModels = await cycleReadOnDisabledModels(delta);
             else if (key === "diffContextLines") await adjustDiffContextLines(delta ?? 1);
             else if (key === "anchorGrepEnabled") {
               const enabled = await toggleAnchorGrep();
-              const active = pi.getActiveTools();
-              pi.setActiveTools(enabled ? [...new Set([...active.filter((t) => t !== "grep"), "anchor_grep"])] : [...new Set([...active.filter((t) => t !== "anchor_grep"), ...(grepWasActive ? ["grep"] : [])])]);
+              grepEnabled = enabled;
+              grepFlavor = enabled ? "anchored" : "vanilla";
+              grepFlavorCwd = enabled ? undefined : ctx.cwd;
+              if (enabled) baseAnchorTools.add("grep");
+              else baseAnchorTools.delete("grep");
             }
             else if (key === "copyMoveEnabled") {
               const enabled = await toggleCopyMove();
               const active = pi.getActiveTools();
               pi.setActiveTools(enabled ? [...new Set([...active, "copy", "move"])] : active.filter((t) => t !== "copy" && t !== "move"));
+              for (const tool of ["copy", "move"]) {
+                if (enabled) baseAnchorTools.add(tool);
+                else baseAnchorTools.delete(tool);
+              }
             }
-            else if (key === "replaceWithinEnabled") {
-              const enabled = await toggleReplaceWithin();
+            else if (key === "replaceMatchEnabled") {
+              const enabled = await toggleReplaceMatch();
               const active = pi.getActiveTools();
-              pi.setActiveTools(enabled ? [...new Set([...active, "replace_within"])] : active.filter((t) => t !== "replace_within"));
+              pi.setActiveTools(enabled ? [...new Set([...active, "replace_match"])] : active.filter((t) => t !== "replace_match"));
+              if (enabled) baseAnchorTools.add("replace_match");
+              else baseAnchorTools.delete("replace_match");
             }
             else if (key === "requirePath") await toggleRequirePath();
             else if (key === "strictInput") await toggleStrictInput();
             await refreshEditTools();
+            await syncModelGate(ctx.model, ctx.cwd);
           },
         });
         await overlay.load();
@@ -208,6 +304,7 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("tool_result", async (event, ctx) => withAnchorSession(ctx, async () => {
     if (event.isError) return;
+    const gated = modelDisabled(ctx.model, disableOnModels);
 
     if (event.toolName === "write") {
       const writtenPath = (event.input as Record<string, unknown>)?.path;
@@ -221,7 +318,7 @@ export default function (pi: ExtensionAPI): void {
           console.error("Failed to clear undo after write:", error);
         }
       }
-      if (!autoRead) return;
+      if (!autoRead || gated) return;
       if (typeof writtenPath !== "string") return;
       try {
         resolvedPath ??= (await resolveInCwd(writtenPath, ctx.cwd)).resolved;
@@ -262,13 +359,13 @@ export default function (pi: ExtensionAPI): void {
 
     if (
       event.toolName !== "replace" &&
-      event.toolName !== "replace_within" &&
+      event.toolName !== "replace_match" &&
       event.toolName !== "insert" &&
       event.toolName !== "copy" &&
       event.toolName !== "move" &&
       event.toolName !== "undo_last_change"
     ) return;
-    if (!autoRead) return;
+    if (!autoRead || gated) return;
 
     const metrics = (event.details as { metrics?: RMetrics } | undefined)?.metrics;
     if (metrics?.classification === "noop") return;
@@ -294,6 +391,7 @@ export default function (pi: ExtensionAPI): void {
     const notices = [warnings, hints].filter((part): part is string => part !== undefined).join("\n\n");
     const emptyDiffNotice = "[post-edit] applied successfully; the diff is empty (no content change: whitespace or line endings only).";
     const noticeText = hasDiff ? (notices ? `${diff}\n\n${notices}` : diff) : notices ? `${emptyDiffNotice}\n\n${notices}` : emptyDiffNotice;
+    const structured = (event as { structuredContent?: unknown }).structuredContent;
     return {
       content: [
         {
@@ -301,6 +399,7 @@ export default function (pi: ExtensionAPI): void {
           text: noticeText,
         },
       ],
+      ...(structured !== undefined ? { structuredContent: withStructuredText(structured, noticeText) } : {}),
     };
   }));
 }

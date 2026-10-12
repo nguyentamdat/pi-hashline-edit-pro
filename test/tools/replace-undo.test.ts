@@ -13,6 +13,7 @@ import {
   getText,
   extractHash,
   makePiStub,
+  toolError,
 } from "../support/fixtures";
 import register from "../../index";
 
@@ -56,7 +57,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -82,7 +83,7 @@ describe("undo_last_change", () => {
     });
   });
 
-  it("undo works with the file_path alias", async () => {
+  it("does not persist the pre-undo content while preparing the undo diff", async () => {
     await withTempFile("sample.ts", "aaa\nbbb\nccc\n", async ({ cwd }) => {
       const { getTool, ctx } = setupIntegrationTest(cwd);
       const editTool = getTool("replace");
@@ -91,21 +92,37 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined,
         undefined,
         ctx,
       );
 
-      const undoResult = await undo.execute(
-        "u1",
-        { file_path: "sample.ts" },
-        undefined,
-        undefined,
-        ctx,
-      );
-      expect(undoResult.isError).toBeFalsy();
-      expect(getText(undoResult)).toMatch(/undone last change/i);
+      const spy = vi.spyOn(hashStoreModule, "persistSnapshot");
+      try {
+        const undoResult = await undo.execute("u1", { path: "sample.ts" }, undefined, undefined, ctx);
+        expect(undoResult.isError).toBeFalsy();
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0]![2]).toBe("aaa\nbbb\nccc\n");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  it("rejects the file_path alias for undo", async () => {
+    await withTempFile("sample.ts", "aaa\nbbb\nccc\n", async ({ cwd }) => {
+      const { getTool, ctx } = setupIntegrationTest(cwd);
+      const undo = getTool("undo_last_change");
+      await expect(
+        undo.execute(
+          "u1",
+          { file_path: "sample.ts" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ).rejects.toThrow(/\[E_BAD_SHAPE\]/);
     });
   });
 
@@ -120,7 +137,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -150,7 +167,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -193,7 +210,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB", "B2"],
+          text: ["BBB", "B2"],
         },
         undefined,
         undefined,
@@ -225,7 +242,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: [],
+          text: [],
         },
         undefined,
         undefined,
@@ -257,7 +274,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[2]!,
-          replacement_lines: [`XXX`, `YYY`, `ZZZ`],
+          text: [`XXX`, `YYY`, `ZZZ`],
         },
         undefined,
         undefined,
@@ -289,7 +306,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -322,7 +339,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -357,18 +374,16 @@ describe("undo_last_change", () => {
           throw new Error("store down");
         });
       try {
-        await expect(
-          editTool.execute(
-            "e1",
-            {
-              remove_from: hashes[1]!, remove_to: hashes[1]!,
-              replacement_lines: ["BBB"],
-            },
-            undefined,
-            undefined,
-            ctx,
-          ),
-        ).rejects.toThrow(/E_UNDO_UNAVAILABLE/);
+        expect(await toolError(() => editTool.execute(
+          "e1",
+          {
+            remove_from: hashes[1]!, remove_to: hashes[1]!,
+            text: ["BBB"],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ))).toMatch(/E_UNDO_UNAVAILABLE/);
       } finally {
         spy.mockRestore();
       }
@@ -380,7 +395,7 @@ describe("undo_last_change", () => {
         "e2",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -400,7 +415,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -412,18 +427,16 @@ describe("undo_last_change", () => {
         .spyOn(fsWriteModule, "writeAtomic")
         .mockRejectedValueOnce(new Error("disk full"));
       try {
-        await expect(
-          editTool.execute(
-            "e2",
-            {
-              remove_from: hashes[2]!, remove_to: hashes[2]!,
-              replacement_lines: ["CCC"],
-            },
-            undefined,
-            undefined,
-            ctx,
-          ),
-        ).rejects.toThrow("disk full");
+        expect(await toolError(() => editTool.execute(
+          "e2",
+          {
+            remove_from: hashes[2]!, remove_to: hashes[2]!,
+            text: ["CCC"],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ))).toContain("disk full");
       } finally {
         spy.mockRestore();
       }
@@ -447,18 +460,16 @@ describe("undo_last_change", () => {
         .spyOn(fsWriteModule, "writeAtomic")
         .mockRejectedValueOnce(new Error("disk full"));
       try {
-        await expect(
-          editTool.execute(
-            "e1",
-            {
-              remove_from: hashes[1]!, remove_to: hashes[1]!,
-              replacement_lines: ["BBB"],
-            },
-            undefined,
-            undefined,
-            ctx,
-          ),
-        ).rejects.toThrow("disk full");
+        expect(await toolError(() => editTool.execute(
+          "e1",
+          {
+            remove_from: hashes[1]!, remove_to: hashes[1]!,
+            text: ["BBB"],
+          },
+          undefined,
+          undefined,
+          ctx,
+        ))).toContain("disk full");
       } finally {
         spy.mockRestore();
       }
@@ -479,7 +490,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -502,7 +513,7 @@ describe("undo_last_change", () => {
             "e2",
             {
               remove_from: hashes[2]!, remove_to: hashes[2]!,
-              replacement_lines: ["CCC"],
+              text: ["CCC"],
             },
             controller.signal,
             undefined,
@@ -532,7 +543,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[1]!, remove_to: hashes[1]!,
-          replacement_lines: ["BBB"],
+          text: ["BBB"],
         },
         undefined,
         undefined,
@@ -571,7 +582,7 @@ describe("undo_last_change", () => {
         "e1",
         {
           remove_from: hashes[0]!, remove_to: hashes[0]!,
-          replacement_lines: ["LINE1"],
+          text: ["LINE1"],
         },
         undefined,
         undefined,
@@ -604,7 +615,7 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, ctx,
       );
 
@@ -642,7 +653,7 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, ctx,
       );
 
@@ -666,7 +677,7 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, ctx,
       );
 
@@ -690,7 +701,7 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, ctx,
       );
 
@@ -727,7 +738,7 @@ describe("undo_last_change", () => {
       await chmod(path, 0o640);
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, ctx,
       );
 
@@ -751,7 +762,7 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, ctx,
       );
 
@@ -803,7 +814,7 @@ describe("undo_last_change", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: emptyHash, remove_to: emptyHash, replacement_lines: ["first", "second"] },
+        { remove_from: emptyHash, remove_to: emptyHash, text: ["first", "second"] },
         undefined, undefined, ctx,
       );
       expect(await readFile(join(cwd, "sample.ts"), "utf-8")).toBe("first\nsecond");
@@ -837,7 +848,7 @@ describe("undo cleared after write", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, { cwd } as any,
       );
 
@@ -863,7 +874,7 @@ describe("undo cleared after write", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[1]!, remove_to: hashes[1]!, replacement_lines: ["BBB"] },
+        { remove_from: hashes[1]!, remove_to: hashes[1]!, text: ["BBB"] },
         undefined, undefined, { cwd } as any,
       );
 
@@ -889,7 +900,7 @@ describe("undo cleared after write", () => {
 
       await editTool.execute(
         "e1",
-        { remove_from: hashes[0]!, remove_to: hashes[0]!, replacement_lines: ["ALPHA"] },
+        { remove_from: hashes[0]!, remove_to: hashes[0]!, text: ["ALPHA"] },
         undefined, undefined, ctx,
       );
 

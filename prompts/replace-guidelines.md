@@ -1,2 +1,0 @@
-- `replace`: same-file same-message calls batch: disjoint ranges, one undo. A call whose anchors resolve nowhere fails alone.
-- `replace`: `replacement_lines` is one string; a pasted `anchor│` prefix is stripped; single line: same anchor for `remove_from` and `remove_to`.

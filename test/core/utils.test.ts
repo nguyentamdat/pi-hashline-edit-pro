@@ -8,7 +8,9 @@ import {
   decodeStringArray,
   assertByteLimit,
   isModeUnsupported,
-  literalEscapeHint,
+  ioErrorCode,
+  literalEscapeHints,
+  mapIoError,
 } from "../../src/utils";
 
 describe("isRec", () => {
@@ -133,7 +135,7 @@ describe("rejectUnknownFields", () => {
     const obj = { path: "test.txt", extra: "value" };
     const allowed = new Set(["path"]);
     expect(() =>
-      rejectUnknownFields(obj, allowed, "Edit 0", "Each edit takes only { replacement_lines, remove_from, remove_to }."),
+      rejectUnknownFields(obj, allowed, "Edit 0", "Each edit takes only { text, remove_from, remove_to }."),
     ).toThrow(/Each edit takes only/);
   });
 
@@ -176,22 +178,22 @@ describe("makePrepareArguments", () => {
     expect(prepare("x")).toBe("x");
   });
 
-  it("normalizes file_path to path", () => {
+  it("leaves file_path untouched", () => {
     const prepare = makePrepareArguments();
     const result = prepare({ file_path: "a.txt", offset: 1 });
-    expect(result).toEqual({ path: "a.txt", offset: 1 });
+    expect(result).toEqual({ file_path: "a.txt", offset: 1 });
   });
 
-  it("normalizes replace_from and replace_to to remove_from and remove_to", () => {
+  it("leaves replace_from and replace_to untouched", () => {
     const prepare = makePrepareArguments();
     const result = prepare({ replace_from: "a", replace_to: "b" });
-    expect(result).toEqual({ remove_from: "a", remove_to: "b" });
+    expect(result).toEqual({ replace_from: "a", replace_to: "b" });
   });
 
-  it("normalizes each remove field only when it is missing", () => {
+  it("passes through mixed canonical and alias fields", () => {
     const prepare = makePrepareArguments();
     const result = prepare({ remove_from: "a", replace_from: "b", replace_to: "c" });
-    expect(result).toEqual({ remove_from: "a", replace_from: "b", remove_to: "c" });
+    expect(result).toEqual({ remove_from: "a", replace_from: "b", replace_to: "c" });
   });
 
   it("does not mutate the original input", () => {
@@ -207,16 +209,22 @@ describe("makePrepareArguments", () => {
     expect(result).toEqual({ path: "a.txt", file_path: "b.txt" });
   });
 
-  it("normalizes from and to to remove_from and remove_to", () => {
+  it("leaves from and to untouched", () => {
     const prepare = makePrepareArguments();
     const result = prepare({ from: "a", to: "b" });
-    expect(result).toEqual({ remove_from: "a", remove_to: "b" });
+    expect(result).toEqual({ from: "a", to: "b" });
   });
 
-  it("normalizes from and to only when the remove field is missing", () => {
+  it("passes through from and to next to canonical fields", () => {
     const prepare = makePrepareArguments();
     const result = prepare({ remove_from: "a", from: "b", to: "c" });
-    expect(result).toEqual({ remove_from: "a", from: "b", remove_to: "c" });
+    expect(result).toEqual({ remove_from: "a", from: "b", to: "c" });
+  });
+  it("canonicalizes anchor aliases when a tool pair is given", () => {
+    const removePrepare = makePrepareArguments("remove");
+    expect(removePrepare({ replace_from: "a", replace_to: "b", text: "x" })).toEqual({ remove_from: "a", remove_to: "b", text: "x" });
+    const replacePrepare = makePrepareArguments("replace");
+    expect(replacePrepare({ remove_from: "a", remove_to: "b", old_string: "x", new_string: "y" })).toEqual({ replace_from: "a", replace_to: "b", old_string: "x", new_string: "y" });
   });
 });
 
@@ -413,28 +421,67 @@ describe("isModeUnsupported", () => {
   });
 });
 
-describe("literalEscapeHint", () => {
-  it("reports the first literal escape sequence", () => {
-    expect(literalEscapeHint([String.raw`stable\u200bCheckout`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\u200b"`);
-    expect(literalEscapeHint([String.raw`a\nb`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\n"`);
-    expect(literalEscapeHint([String.raw`say \"hi\"`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\""`);
-    expect(literalEscapeHint([String.raw`\n\t`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\n"`);
+describe("literalEscapeHints", () => {
+  it("reports literal escape sequences in order", () => {
+    expect(literalEscapeHints([String.raw`stable\u200bCheckout`], "lines")).toEqual([String.raw`[H_LITERAL_ESCAPE] lines: "\u200b" written as literal text`]);
+    expect(literalEscapeHints([String.raw`a\nb`], "lines")).toEqual([String.raw`[H_LITERAL_ESCAPE] lines: "\n" written as literal text`]);
+    expect(literalEscapeHints([String.raw`say \"hi\"`], "lines")).toEqual([String.raw`[H_LITERAL_ESCAPE] lines: "\"" written as literal text`]);
+    expect(literalEscapeHints([String.raw`\n\t`], "lines")).toEqual([
+      String.raw`[H_LITERAL_ESCAPE] lines: "\n" written as literal text`,
+      String.raw`[H_LITERAL_ESCAPE] lines: "\t" written as literal text`,
+    ]);
   });
 
-  it("returns undefined for real characters and plain text", () => {
-    expect(literalEscapeHint(["stable\u200bCheckout"], "lines")).toBeUndefined();
-    expect(literalEscapeHint(["a\nb"], "lines")).toBeUndefined();
-    expect(literalEscapeHint([String.raw`/^\d+\.\d+$/`], "lines")).toBeUndefined();
-    expect(literalEscapeHint([], "lines")).toBeUndefined();
+  it("reports each distinct escape once and caps the list at three", () => {
+    expect(literalEscapeHints([String.raw`\u200b`, String.raw`\u2060`, String.raw`\u200b`], "lines")).toEqual([
+      String.raw`[H_LITERAL_ESCAPE] lines: "\u200b" written as literal text`,
+      String.raw`[H_LITERAL_ESCAPE] lines: "\u2060" written as literal text`,
+    ]);
+    expect(literalEscapeHints([String.raw`\u200b \u2060 \u00a0 \u2011`], "lines")).toHaveLength(3);
+  });
+
+  it("returns an empty list for real characters and plain text", () => {
+    expect(literalEscapeHints(["stable\u200bCheckout"], "lines")).toEqual([]);
+    expect(literalEscapeHints(["a\nb"], "lines")).toEqual([]);
+    expect(literalEscapeHints([String.raw`/^\d+\.\d+$/`], "lines")).toEqual([]);
+    expect(literalEscapeHints([], "lines")).toEqual([]);
   });
 
   it("skips valid surrogate pairs and the dedicated placeholder", () => {
-    expect(literalEscapeHint([String.raw`\uD83D\uDE00`], "lines")).toBeUndefined();
-    expect(literalEscapeHint([String.raw`\uDDDD`], "lines")).toBeUndefined();
-    expect(literalEscapeHint([String.raw`\uD83D`], "lines")).toBe(String.raw`[H_LITERAL_ESCAPE] "lines" contains the literal escaped text "\uD83D"`);
+    expect(literalEscapeHints([String.raw`\uD83D\uDE00`], "lines")).toEqual([]);
+    expect(literalEscapeHints([String.raw`\uDDDD`], "lines")).toEqual([]);
+    expect(literalEscapeHints([String.raw`\uD83D`], "lines")).toEqual([String.raw`[H_LITERAL_ESCAPE] lines: "\uD83D" written as literal text`]);
   });
 
   it("skips simple escapes in a line that also has a real break", () => {
-    expect(literalEscapeHint([String.raw`a\nb` + "\nc"], "lines")).toBeUndefined();
+    expect(literalEscapeHints([String.raw`a\nb` + "\nc"], "lines")).toEqual([]);
+  });
+});
+
+describe("mapIoError", () => {
+  it("maps errno codes to documented error codes", () => {
+    expect(mapIoError(Object.assign(new Error("permission denied"), { code: "EACCES" }), "write", "/tmp/a").message).toBe(
+      "[E_ACCESS] Cannot write /tmp/a: permission denied",
+    );
+    expect(mapIoError(Object.assign(new Error("no such file"), { code: "ENOENT" }), "read", "/tmp/a").message).toBe(
+      "[E_NOT_FOUND] Cannot read /tmp/a: no such file",
+    );
+    expect(mapIoError(Object.assign(new Error("is a directory"), { code: "EISDIR" }), "write", "/tmp/a").message).toBe(
+      "[E_ACCESS] Cannot write /tmp/a: is a directory",
+    );
+  });
+
+  it("keeps already coded errors and code-less errors unchanged", () => {
+    const coded = new Error("[E_PATH_CHANGED] Refusing to write /tmp/a");
+    expect(mapIoError(coded, "write", "/tmp/a")).toBe(coded);
+    const plain = new Error("chmod failed");
+    expect(mapIoError(plain, "write", "/tmp/a")).toBe(plain);
+  });
+
+  it("reports the code for errno errors and nothing for other errors", () => {
+    expect(ioErrorCode(Object.assign(new Error("denied"), { code: "EPERM" }))).toBe("E_ACCESS");
+    expect(ioErrorCode(Object.assign(new Error("gone"), { code: "ENOENT" }))).toBe("E_NOT_FOUND");
+    expect(ioErrorCode(new Error("plain"))).toBeUndefined();
+    expect(ioErrorCode(Object.assign(new Error("weird"), { code: "EUNKNOWN" }))).toBeUndefined();
   });
 });

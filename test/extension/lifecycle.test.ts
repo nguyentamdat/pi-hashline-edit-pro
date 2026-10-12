@@ -9,15 +9,15 @@ async function registerExtension(pi: any) {
 }
 
 describe("session_start lifecycle", () => {
-  it("removes the built-in edit and grep tools while keeping anchor_grep", async () => {
+  it("removes the built-in edit tool while keeping grep", async () => {
     await withTempDir("lifecycle-tools-", async (dir) => {
       const { pi, handlers } = makePiStub();
-      pi.setActiveTools(["read", "replace", "edit", "grep", "anchor_grep", "bash"]);
+      pi.setActiveTools(["read", "replace", "edit", "grep", "bash"]);
       await registerExtension(pi);
       const sessionStart = handlers.get("session_start");
       expect(sessionStart).toBeDefined();
       await sessionStart!({}, { cwd: dir, ui: { notify: vi.fn() } });
-      expect(pi.getActiveTools()).toEqual(["read", "replace", "anchor_grep", "bash"]);
+      expect(pi.getActiveTools()).toEqual(["read", "replace", "grep", "bash"]);
     });
   });
 
@@ -93,6 +93,19 @@ describe("session_start lifecycle", () => {
       expect(JSON.parse(lines[1]!).kind).toBe("allocate");
     });
   });
+  it("adds the codemode contract guideline only when codemode is active", async () => {
+    await withTempDir("lifecycle-codemode-prompts-", async (dir) => {
+      const withCode = makePiStub(["read", "replace", "insert", "grep", "undo_last_change", "codemode"]);
+      await registerExtension(withCode.pi);
+      await withCode.handlers.get("session_start")!({}, { cwd: dir, ui: { notify: vi.fn() } });
+      expect((withCode.getTool("read").promptGuidelines as string[]).some((g) => g.includes("failures resolve to"))).toBe(true);
+
+      const withoutCode = makePiStub(["read", "replace", "insert", "grep", "undo_last_change"]);
+      await registerExtension(withoutCode.pi);
+      await withoutCode.handlers.get("session_start")!({}, { cwd: dir, ui: { notify: vi.fn() } });
+      expect((withoutCode.getTool("read").promptGuidelines as string[]).some((g) => g.includes("failures resolve to"))).toBe(false);
+    });
+  });
 });
 
 describe("hashline-config command", () => {
@@ -138,26 +151,6 @@ describe("session_shutdown lifecycle", () => {
       await rm(join(sessionClaimsDir(), `${sessionKeyFor(ctx)!}.registry.jsonl`), { force: true });
       await handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx);
       expect(await withAnchorSession(ctx, () => ownerOf(anchor))).toBeUndefined();
-    });
-  });
-  it("clears only the shutting-down session's auto-read-all completions", async () => {
-    await withTempDir("lifecycle-auto-read-clear-", async (dir) => {
-      const { join } = await import("path");
-      const { pi, handlers } = makePiStub();
-      await registerExtension(pi);
-      const { sessionKeyFor } = await import("../../src/anchor-registry");
-      const { recordAutoReadAllComplete, getAutoReadAllSnapshot } = await import("../../src/auto-read-all-state");
-      const sample = join(dir, "sample.txt");
-      const other = join(dir, "other.txt");
-      const ctx = { cwd: dir, ui: { notify: vi.fn() }, sessionManager: { getSessionFile: () => join(dir, "session.jsonl"), getSessionId: () => "lifecycle" } };
-      const key = sessionKeyFor(ctx);
-      recordAutoReadAllComplete(key, sample, "snap-a");
-      recordAutoReadAllComplete("other-session", other, "snap-b");
-      expect(getAutoReadAllSnapshot(key, sample)).toBe("snap-a");
-      expect(getAutoReadAllSnapshot("other-session", other)).toBe("snap-b");
-      await handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx);
-      expect(getAutoReadAllSnapshot(key, sample)).toBeUndefined();
-      expect(getAutoReadAllSnapshot("other-session", other)).toBe("snap-b");
     });
   });
 });

@@ -5,23 +5,27 @@ import { constants } from "node:fs";
 import { execPipeline, noteAnchorError, previewFromPipe, previewError, type PipelineResult, type ReplaceDetails } from "./replace";
 import { commitEdit } from "./commit";
 import { readNormFile, safeSnapId, type NormFile } from "./file-reader";
+import { preEditSnapshotFor } from "./pre-edit-snapshot";
 import {
-  assertRangeServed,
-  lineChecksum,
   lineHashes,
   MAX_HASH_LINES,
   parseHashRef,
+  planEdit,
+  preserveDeletionSeparators,
+  resEdit,
   resolveAnchorLine,
   stripAnchorRow,
   type Anchor,
+  type HEdit,
   type HTEdit,
 } from "./hashline";
 import { formatAnchorReclaimNotice, servedForPath, takeReclaimedPaths, withAnchorSession } from "./anchor-registry";
-import { loadP, loadGuide } from "./prompts";
+import { batchMemberFor, batchServedFor, ensureBatchBase, executeBatchMember, noteBatchFailure, pendingBatchMemberFor, registerBatchPlanner, type BatchBase, type BatchMemberPlanner, type PlannedMember } from "./batch";
+import { loadP, loadGuidelines } from "./prompts";
 import { assertTransferReq, normReq, type TransferReq } from "./payload-contract";
 import { abortIf, assertByteLimit, isRec, splitLines } from "./utils";
 import { toDisplayPath } from "./paths";
-import { getDiffContextLines, readConfig } from "./config";
+import { getDiffContextLines } from "./config";
 import { resolveInCwd, writeAtomic } from "./fs-write";
 import { restoreEndings, type LineEnding } from "./normalize";
 import { applyEndingOverrides, endingsForRange, joinSeparators, separatorsForSpans } from "./line-endings";
@@ -29,6 +33,8 @@ import { saveUndo, type UndoEntry } from "./replace-undo";
 import { buildChanged, buildMetrics, type TResult } from "./replace-response";
 import { servedHashesFromDiff, serveRows } from "./served";
 import {
+  assertBoundaryLinesServed,
+  assertPathOption,
   DEFAULT_EDIT_FLAGS,
   editRenderResultWrapper,
   editToolBase,
@@ -36,17 +42,20 @@ import {
   resolveEditTarget,
   throwIfStrictInput,
   tryResolveEditTarget,
+  trustRangeServed,
   withTransferPrompts,
   type EditToolFlags,
 } from "./edit-common";
 import { makeRenderCall, type RPreview, type RRState } from "./replace-render";
+import { anchoredLinesFromDiff, diffAnchorsOmitted, editResultSchema, withStructuredErrors, type EditStructured } from "./structured";
 
 export type TransferKind = "copy" | "move";
 
 interface TransferRefs {
   sourceFrom: Anchor;
   sourceTo: Anchor;
-  insertAfter: Anchor;
+  anchor: Anchor;
+  direction: "before" | "after";
 }
 
 export interface TransferPlan {
@@ -63,46 +72,8 @@ interface PairFileCommit {
   absolutePath: string;
   mutationTargetPath: string;
   foldedAnchorLines: number;
+  anchorCarry?: number;
   endingOverrides?: (LineEnding | undefined)[];
-}
-
-function assertRangeVerified(
-  fileLines: string[],
-  fileHashes: string[],
-  start: number,
-  end: number,
-  served: ReadonlyMap<string, string> | undefined,
-  displayPath: string,
-): void {
-  if (served === undefined) return;
-  assertRangeServed(
-    {
-      content_lines: [],
-      hash_bounds: [
-        { line: start, hash: fileHashes[start - 1]! },
-        { line: end, hash: fileHashes[end - 1]! },
-      ],
-    },
-    fileLines,
-    fileHashes,
-    served,
-    displayPath,
-  );
-}
-
-function trustSpan(
-  fileLines: string[],
-  fileHashes: string[],
-  served: ReadonlyMap<string, string> | undefined,
-  start: number,
-  end: number,
-): ReadonlyMap<string, string> | undefined {
-  if (served === undefined) return undefined;
-  const merged = new Map(served);
-  for (let line = start; line <= end; line++) {
-    merged.set(fileHashes[line - 1]!, lineChecksum(fileLines[line - 1]!));
-  }
-  return merged;
 }
 
 function dedupeWarnings(warnings: string[]): string[] {
@@ -120,12 +91,13 @@ export function parseTransferAnchors(req: TransferReq): { refs: TransferRefs; wa
   const warnings: string[] = [];
   const from = stripAnchorRow(req.source_from.trim(), "source_from entry", warnings);
   const to = stripAnchorRow(req.source_to.trim(), "source_to entry", warnings);
-  const after = stripAnchorRow(req.insert_after.trim(), "insert_after entry", warnings);
+  const destination = stripAnchorRow(req.anchor.trim(), "anchor entry", warnings);
   return {
     refs: {
       sourceFrom: parseHashRef(from),
       sourceTo: parseHashRef(to),
-      insertAfter: parseHashRef(after),
+      anchor: parseHashRef(destination),
+      direction: req.direction,
     },
     warnings,
   };
@@ -151,26 +123,32 @@ export function buildTransferEdit(input: {
   const toLine = resolveAnchorLine(refs.sourceTo, fileLines, preload.fileHashes, displayPath);
   const sourceStart = Math.min(fromLine, toLine);
   const sourceEnd = Math.max(fromLine, toLine);
-  const insertLine = resolveAnchorLine(refs.insertAfter, fileLines, preload.fileHashes, displayPath);
+  const anchorLine = resolveAnchorLine(refs.anchor, fileLines, preload.fileHashes, displayPath);
+  const insertLine = refs.direction === "after" ? anchorLine : anchorLine - 1;
   if (insertLine >= sourceStart && insertLine < sourceEnd) {
     throw new Error(
-      `[E_BAD_SHAPE] "insert_after" resolves to line ${insertLine}, inside the source range (lines ${sourceStart}-${sourceEnd}). Use a line before source_from, or source_to to place the block right after itself.`,
+      `[E_BAD_SHAPE] "anchor" resolves to line ${anchorLine}, which places the block inside the source range (lines ${sourceStart}-${sourceEnd}). Use a line outside the source range.`,
     );
   }
-  assertRangeVerified(fileLines, preload.fileHashes, insertLine, insertLine, served, displayPath);
-  assertRangeVerified(fileLines, preload.fileHashes, sourceStart, sourceEnd, served, displayPath);
+  assertBoundaryLinesServed(fileLines, preload.fileHashes, served, anchorLine, anchorLine, displayPath);
+  assertBoundaryLinesServed(fileLines, preload.fileHashes, served, sourceStart, sourceStart, displayPath);
+  assertBoundaryLinesServed(fileLines, preload.fileHashes, served, sourceEnd, sourceEnd, displayPath);
   const sourceLines = fileLines.slice(sourceStart - 1, sourceEnd);
   const sourceEndings = endingsForRange(preload.endingSeparators, sourceStart, sourceEnd);
   if (kind === "copy") {
     return {
       editParams: {
-        remove_from: preload.fileHashes[insertLine - 1]!,
-        remove_to: preload.fileHashes[insertLine - 1]!,
-        replacement_lines: [fileLines[insertLine - 1]!, ...sourceLines],
+        remove_from: preload.fileHashes[anchorLine - 1]!,
+        remove_to: preload.fileHashes[anchorLine - 1]!,
+        text: refs.direction === "after"
+          ? [fileLines[anchorLine - 1]!, ...sourceLines]
+          : [...sourceLines, fileLines[anchorLine - 1]!],
       },
       foldedAnchorLines: 1,
-      anchorCarry: 0,
-      endingOverrides: [undefined, ...sourceEndings],
+      anchorCarry: refs.direction === "after" ? 0 : sourceLines.length,
+      endingOverrides: refs.direction === "after"
+        ? [undefined, ...sourceEndings]
+        : [...sourceEndings, undefined],
     };
   }
   if (insertLine < sourceStart) {
@@ -180,10 +158,10 @@ export function buildTransferEdit(input: {
       editParams: {
         remove_from: preload.fileHashes[replacedStart - 1]!,
         remove_to: preload.fileHashes[replacedEnd - 1]!,
-        replacement_lines: [...sourceLines, ...fileLines.slice(insertLine, sourceStart - 1)],
+        text: [...sourceLines, ...fileLines.slice(insertLine, sourceStart - 1)],
       },
       foldedAnchorLines: 0,
-      servedOverride: trustSpan(fileLines, preload.fileHashes, served, replacedStart, replacedEnd),
+      servedOverride: trustRangeServed(fileLines, preload.fileHashes, served, replacedStart, replacedEnd),
       endingOverrides: sourceEndings,
     };
   }
@@ -193,31 +171,42 @@ export function buildTransferEdit(input: {
     editParams: {
       remove_from: preload.fileHashes[replacedStart - 1]!,
       remove_to: preload.fileHashes[replacedEnd - 1]!,
-      replacement_lines: [...fileLines.slice(sourceEnd, insertLine), ...sourceLines],
+      text: [...fileLines.slice(sourceEnd, insertLine), ...sourceLines],
     },
     foldedAnchorLines: 0,
-    servedOverride: trustSpan(fileLines, preload.fileHashes, served, replacedStart, replacedEnd),
+    servedOverride: trustRangeServed(fileLines, preload.fileHashes, served, replacedStart, replacedEnd),
     endingOverrides: offsetEndings(insertLine - sourceEnd, sourceEndings),
   };
 }
 
+function describeTransferTargets(sourcePath: string, destinationPath: string): string {
+  return sourcePath === destinationPath
+    ? `the file "${sourcePath}"`
+    : `the source file "${sourcePath}" or the destination file "${destinationPath}"`;
+}
+
 async function resolveTransferTargets(req: TransferReq, cwd: string): Promise<{ sourcePath: string; destinationPath: string }> {
-  const { requirePath } = await readConfig();
-  if (!requirePath && req.path !== undefined) {
-    throw new Error("[E_BAD_SHAPE] Edit request contains unknown or unsupported fields: path. Path resolution is anchor-only; retry without `path`.");
-  }
-  if (requirePath && (typeof req.path !== "string" || req.path.length === 0)) {
-    throw new Error('[E_BAD_SHAPE] Copy/move request requires a non-empty "path" string when require-path mode is on. Provide `path` matching the source or destination file the anchors were served for.');
-  }
   const sourcePath = resolveEditTarget(req.source_from, req.source_to);
-  const destinationPath = resolveEditTarget(req.insert_after);
-  if (requirePath) {
-    const { resolved } = await resolveInCwd(req.path as string, cwd);
-    if (resolved !== sourcePath && resolved !== destinationPath) {
-      throw new Error(`[E_BAD_SHAPE] Provided "path" "${req.path}" does not match the source file "${sourcePath}" or the destination file "${destinationPath}".`);
-    }
-  }
+  const destinationPath = resolveEditTarget(req.anchor);
+  await assertPathOption({
+    providedPath: req.path,
+    cwd,
+    targets: [sourcePath, destinationPath],
+    expected: describeTransferTargets(sourcePath, destinationPath),
+    requestLabel: "Copy/move request",
+  });
   return { sourcePath, destinationPath };
+}
+
+async function assertTransferPathOption(req: TransferReq, cwd: string, member: PlannedMember): Promise<void> {
+  const sourceTarget = member.sourceTarget ?? member.target;
+  await assertPathOption({
+    providedPath: req.path,
+    cwd,
+    targets: [sourceTarget, member.target],
+    expected: describeTransferTargets(sourceTarget, member.target),
+    requestLabel: "Copy/move request",
+  });
 }
 
 interface CrossTransferPreparation {
@@ -227,6 +216,7 @@ interface CrossTransferPreparation {
   destinationDisplay: string;
   destinationEdit: HTEdit;
   destinationFolded: number;
+  anchorCarry?: number;
   endingOverrides: (LineEnding | undefined)[];
   sourceEdit?: HTEdit;
 }
@@ -239,16 +229,26 @@ async function prepareCrossTransfer(input: {
   cwd: string;
   signal?: AbortSignal;
   noPersist: boolean;
+  sourcePreload?: NormFile;
+  destinationPreload?: NormFile;
+  sourceServed?: ReadonlyMap<string, string>;
+  destinationServed?: ReadonlyMap<string, string>;
 }): Promise<CrossTransferPreparation> {
   const { kind, refs, sourcePath, destinationPath, cwd, signal, noPersist } = input;
   const common = { signal, maxLines: MAX_HASH_LINES };
   const sourceAccessMode = kind === "move" ? constants.R_OK | constants.W_OK : constants.R_OK;
-  const sourcePreload = await readNormFile(sourcePath, cwd, noPersist ? { ...common, accessMode: constants.R_OK, noPersist: true, allocation: "shadow" } : { ...common, accessMode: sourceAccessMode });
-  const destinationPreload = await readNormFile(destinationPath, cwd, noPersist ? { ...common, accessMode: constants.R_OK, noPersist: true, allocation: "shadow" } : { ...common, accessMode: constants.R_OK | constants.W_OK });
+  const candidate = kind === "copy" && input.sourcePreload === undefined ? preEditSnapshotFor(sourcePath) : undefined;
+  const snapshotPreload = candidate !== undefined
+    && candidate.fileHashes.includes(refs.sourceFrom.hash)
+    && candidate.fileHashes.includes(refs.sourceTo.hash)
+    ? candidate
+    : undefined;
+  const sourcePreload = input.sourcePreload ?? snapshotPreload ?? (await readNormFile(sourcePath, cwd, noPersist ? { ...common, accessMode: constants.R_OK, noPersist: true, allocation: "shadow" } : { ...common, accessMode: sourceAccessMode }));
+  const destinationPreload = input.destinationPreload ?? (await readNormFile(destinationPath, cwd, noPersist ? { ...common, accessMode: constants.R_OK, noPersist: true, allocation: "shadow" } : { ...common, accessMode: constants.R_OK | constants.W_OK }));
   const sourceDisplay = toDisplayPath(cwd, sourcePreload.absolutePath, sourcePath);
   const destinationDisplay = toDisplayPath(cwd, destinationPreload.absolutePath, destinationPath);
-  const sourceServed = servedForPath(sourcePreload.absolutePath);
-  const destinationServed = servedForPath(destinationPreload.absolutePath);
+  const sourceServed = input.sourceServed ?? (snapshotPreload !== undefined ? snapshotPreload.served : servedForPath(sourcePreload.absolutePath));
+  const destinationServed = input.destinationServed ?? servedForPath(destinationPreload.absolutePath);
   const sourceLines = splitLines(sourcePreload.normalized);
   const destinationLines = splitLines(destinationPreload.normalized);
 
@@ -272,21 +272,22 @@ async function prepareCrossTransfer(input: {
     throw error;
   }
   try {
-    assertRangeVerified(sourceLines, sourcePreload.fileHashes, sourceStart, sourceEnd, sourceServed, sourceDisplay);
+    assertBoundaryLinesServed(sourceLines, sourcePreload.fileHashes, sourceServed, sourceStart, sourceStart, sourceDisplay);
+    assertBoundaryLinesServed(sourceLines, sourcePreload.fileHashes, sourceServed, sourceEnd, sourceEnd, sourceDisplay);
   } catch (error) {
     await adopt(sourcePreload.absolutePath, error);
     throw error;
   }
 
-  let insertLine = 0;
+  let anchorLine = 0;
   try {
-    insertLine = resolveAnchorLine(refs.insertAfter, destinationLines, destinationPreload.fileHashes, destinationDisplay);
+    anchorLine = resolveAnchorLine(refs.anchor, destinationLines, destinationPreload.fileHashes, destinationDisplay);
   } catch (error) {
     await adopt(destinationPreload.absolutePath, error);
     throw error;
   }
   try {
-    assertRangeVerified(destinationLines, destinationPreload.fileHashes, insertLine, insertLine, destinationServed, destinationDisplay);
+    assertBoundaryLinesServed(destinationLines, destinationPreload.fileHashes, destinationServed, anchorLine, anchorLine, destinationDisplay);
   } catch (error) {
     await adopt(destinationPreload.absolutePath, error);
     throw error;
@@ -297,25 +298,35 @@ async function prepareCrossTransfer(input: {
     ? {
         remove_from: destinationPreload.fileHashes[0]!,
         remove_to: destinationPreload.fileHashes[0]!,
-        replacement_lines: [...moved],
+        text: [...moved],
       }
-    : {
-        remove_from: destinationPreload.fileHashes[insertLine - 1]!,
-        remove_to: destinationPreload.fileHashes[insertLine - 1]!,
-        replacement_lines: [destinationLines[insertLine - 1]!, ...moved],
-      };
+    : refs.direction === "after"
+      ? {
+          remove_from: destinationPreload.fileHashes[anchorLine - 1]!,
+          remove_to: destinationPreload.fileHashes[anchorLine - 1]!,
+          text: [destinationLines[anchorLine - 1]!, ...moved],
+        }
+      : {
+          remove_from: destinationPreload.fileHashes[anchorLine - 1]!,
+          remove_to: destinationPreload.fileHashes[anchorLine - 1]!,
+          text: [...moved, destinationLines[anchorLine - 1]!],
+        };
   const destinationFolded = destinationPreload.normalized.length === 0 ? 0 : 1;
   const sourceEndings = endingsForRange(sourcePreload.endingSeparators, sourceStart, sourceEnd);
-  const endingOverrides = destinationFolded === 1 ? offsetEndings(1, sourceEndings) : sourceEndings;
+  const endingOverrides = destinationFolded === 0
+    ? sourceEndings
+    : refs.direction === "after"
+      ? offsetEndings(1, sourceEndings)
+      : sourceEndings;
   if (kind === "copy") {
-    return { sourcePreload, destinationPreload, sourceDisplay, destinationDisplay, destinationEdit, destinationFolded, endingOverrides };
+    return { sourcePreload, destinationPreload, sourceDisplay, destinationDisplay, destinationEdit, destinationFolded, ...(destinationFolded === 1 ? { anchorCarry: refs.direction === "after" ? 0 : moved.length } : {}), endingOverrides };
   }
   const sourceEdit: HTEdit = {
     remove_from: sourcePreload.fileHashes[sourceStart - 1]!,
     remove_to: sourcePreload.fileHashes[sourceEnd - 1]!,
-    replacement_lines: [],
+    text: [],
   };
-  return { sourcePreload, destinationPreload, sourceDisplay, destinationDisplay, destinationEdit, destinationFolded, sourceEdit, endingOverrides };
+  return { sourcePreload, destinationPreload, sourceDisplay, destinationDisplay, destinationEdit, destinationFolded, ...(destinationFolded === 1 ? { anchorCarry: refs.direction === "after" ? 0 : moved.length } : {}), sourceEdit, endingOverrides };
 }
 
 function pairEntry(pipe: PipelineResult, separators: LineEnding[] | undefined): UndoEntry {
@@ -343,14 +354,15 @@ async function commitMovePair(input: {
   ]);
   const destinationSpan = input.destination.pipe.spans?.[0];
   const sourceSpan = input.source.pipe.spans?.[0];
+  if (destinationSpan && input.destination.anchorCarry !== undefined) destinationSpan.carry = input.destination.anchorCarry;
   const destinationSeparators = destinationSpan
-    ? separatorsForSpans(input.destination.pipe.originalSeparators, input.destination.pipe.originalHashes.length, [destinationSpan], input.destination.pipe.result, input.destination.pipe.originalEnding)
+    ? separatorsForSpans(input.destination.pipe.originalSeparators, input.destination.pipe.originalHashes.length, [destinationSpan], input.destination.pipe.result, input.destination.pipe.originalEnding, splitLines(input.destination.pipe.originalNormalized))
     : undefined;
   if (destinationSeparators !== undefined && destinationSpan !== undefined) {
     applyEndingOverrides(destinationSeparators, destinationSpan.start, input.destination.endingOverrides);
   }
   const sourceSeparators = sourceSpan
-    ? separatorsForSpans(input.source.pipe.originalSeparators, input.source.pipe.originalHashes.length, [sourceSpan], input.source.pipe.result, input.source.pipe.originalEnding)
+    ? separatorsForSpans(input.source.pipe.originalSeparators, input.source.pipe.originalHashes.length, [sourceSpan], input.source.pipe.result, input.source.pipe.originalEnding, splitLines(input.source.pipe.originalNormalized))
     : undefined;
   const destinationBytes = input.destination.pipe.bom + (destinationSeparators !== undefined
     ? joinSeparators(input.destination.pipe.result, destinationSeparators)
@@ -484,6 +496,20 @@ async function commitMovePair(input: {
     ? `${patchTruncation.content}\n... [cross-file move patch truncated at ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; the patch cannot be applied as-is. Use read to see the full files.]`
     : rawPatch;
   const patchTruncated = patchTruncation.truncated || sourceChanged.details.patchTruncated === true || destinationChanged.details.patchTruncated === true;
+  const structuredContent: EditStructured = {
+    ok: true,
+    kind: "edit",
+    verb: "moved",
+    classification: "applied",
+    path: input.destination.displayPath,
+    text: `Successfully moved ${movedLines} line(s) from ${input.source.displayPath} to ${input.destination.displayPath}.${warningBlock}`,
+    diff,
+    warnings: [...warnings],
+    hints: [],
+    firstChangedLine: input.destination.pipe.firstChangedLine ?? null,
+    anchors: anchoredLinesFromDiff(destinationChanged.details.diff, destinationChanged.details.diffLineNumbers),
+    anchorsOmitted: diffTruncation.truncated || patchTruncated || diffAnchorsOmitted(destinationChanged.details.diff),
+  };
   return {
     content: [
       {
@@ -507,6 +533,7 @@ async function commitMovePair(input: {
       }),
       ...(warnings.length > 0 ? { warnings: [...warnings] } : {}),
     },
+    structuredContent,
   };
 }
 
@@ -553,7 +580,7 @@ async function executeCrossFile(
         absolutePath: destination.absolute,
         mutationTargetPath: destination.resolved,
         editAnchors: [prepared.destinationEdit.remove_from, prepared.destinationEdit.remove_to],
-        ...(prepared.destinationFolded === 1 ? { anchorCarry: 0 } : {}),
+        ...(prepared.anchorCarry !== undefined ? { anchorCarry: prepared.anchorCarry } : {}),
         endingOverrides: prepared.endingOverrides,
         signal,
         verb: "copied",
@@ -566,7 +593,7 @@ async function executeCrossFile(
       accessMode: constants.R_OK | constants.W_OK,
       signal,
       preloadedNorm: prepared.sourcePreload,
-      allowEmpty: true,
+      preserveDeletionSeparators: false,
     });
     return commitMovePair({
       source: { pipe: sourcePipe, displayPath: prepared.sourceDisplay, absolutePath: source.absolute, mutationTargetPath: source.resolved, foldedAnchorLines: 0 },
@@ -576,11 +603,186 @@ async function executeCrossFile(
         absolutePath: destination.absolute,
         mutationTargetPath: destination.resolved,
         foldedAnchorLines: prepared.destinationFolded,
+        ...(prepared.anchorCarry !== undefined ? { anchorCarry: prepared.anchorCarry } : {}),
         endingOverrides: prepared.endingOverrides,
       },
       signal,
       warnings: anchorWarnings,
     });
+  });
+}
+
+function preloadFromBase(base: BatchBase): NormFile {
+  return {
+    absolutePath: base.absolutePath,
+    normalized: base.content,
+    bom: base.bom,
+    originalEnding: base.ending,
+    endingSeparators: base.separators,
+    fileHashes: base.hashes,
+    hadUtf8DecodeErrors: base.hadUtf8DecodeErrors,
+    identity: base.identity,
+  };
+}
+
+function planTransferBatchMember(kind: TransferKind): BatchMemberPlanner {
+  return (input) => {
+    if (input.member.sourceTarget !== undefined && input.member.sourceTarget !== input.member.target) return undefined;
+    const req = normReq(input.member.args);
+    assertTransferReq(req);
+    const { refs, warnings } = parseTransferAnchors(req);
+    const preload = preloadFromBase(input.base);
+    const transferPlan = buildTransferEdit({ kind, refs, preload, displayPath: input.displayPath, served: input.served });
+    const resWarnings: string[] = [];
+    const hedit = resEdit(transferPlan.editParams, resWarnings);
+    const effectiveHedit = preserveDeletionSeparators(hedit, input.base.baseLines, input.base.hashes);
+    const planned = planEdit(input.base.content, effectiveHedit, input.base.hashes, {
+      filePath: input.displayPath,
+      servedHashes: transferPlan.servedOverride ?? input.served,
+      signal: input.signal,
+      baseFileLines: input.base.baseLines,
+    });
+    return {
+      hedit,
+      warnings: [...warnings, ...resWarnings],
+      planned,
+      foldedLines: transferPlan.foldedAnchorLines,
+      direction: refs.direction,
+      ...(transferPlan.anchorCarry !== undefined ? { carryIndex: transferPlan.anchorCarry } : {}),
+      ...(transferPlan.servedOverride !== undefined ? { servedOverride: transferPlan.servedOverride } : {}),
+      ...(transferPlan.endingOverrides !== undefined ? { contentSeparators: transferPlan.endingOverrides } : {}),
+    };
+  };
+}
+
+registerBatchPlanner("copy", planTransferBatchMember("copy"));
+registerBatchPlanner("move", planTransferBatchMember("move"));
+
+async function executeBatchCrossCopy(
+  member: PlannedMember,
+  refs: TransferRefs,
+  warnings: string[],
+  sourcePath: string,
+  destinationPath: string,
+  mutationTargetPath: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<TResult> {
+  const destinationBase = await ensureBatchBase({ member, targetPath: destinationPath, mutationTargetPath, cwd, signal });
+  let prepared: CrossTransferPreparation;
+  try {
+    const sourceMember = pendingBatchMemberFor(sourcePath);
+    const sourcePreload = sourceMember
+      ? preloadFromBase(await ensureBatchBase({ member: sourceMember, targetPath: sourcePath, mutationTargetPath: sourceMember.target, cwd, signal }))
+      : undefined;
+    prepared = await prepareCrossTransfer({
+      kind: "copy",
+      refs,
+      sourcePath,
+      destinationPath,
+      cwd,
+      signal,
+      noPersist: false,
+      sourcePreload,
+      sourceServed: sourceMember !== undefined ? batchServedFor(sourceMember) : undefined,
+      destinationServed: batchServedFor(member),
+      destinationPreload: preloadFromBase(destinationBase),
+    });
+  } catch (error) {
+    noteBatchFailure(member, error);
+    throw error;
+  }
+  const resWarnings: string[] = [];
+  let hedit: HEdit;
+  try {
+    hedit = resEdit(prepared.destinationEdit, resWarnings);
+  } catch (error) {
+    noteBatchFailure(member, error);
+    throw error;
+  }
+  return executeBatchMember({
+    member,
+    targetPath: destinationPath,
+    mutationTargetPath,
+    cwd,
+    signal,
+    plan: {
+      hedit,
+      warnings: [...warnings, ...resWarnings],
+      foldedLines: prepared.destinationFolded,
+      ...(prepared.anchorCarry !== undefined ? { carryIndex: prepared.anchorCarry } : {}),
+      contentSeparators: prepared.endingOverrides,
+    },
+  });
+}
+
+async function executeBatchCrossMove(
+  member: PlannedMember,
+  refs: TransferRefs,
+  warnings: string[],
+  sourcePath: string,
+  destinationPath: string,
+  mutationTargetPath: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<TResult> {
+  const destinationBase = await ensureBatchBase({ member, targetPath: destinationPath, mutationTargetPath, cwd, signal });
+  let prepared: CrossTransferPreparation;
+  let sourcePipe: PipelineResult;
+  try {
+    const sourcePreload = await readNormFile(sourcePath, cwd, { signal, accessMode: constants.R_OK | constants.W_OK, maxLines: MAX_HASH_LINES });
+    prepared = await prepareCrossTransfer({
+      kind: "move",
+      refs,
+      sourcePath,
+      destinationPath,
+      cwd,
+      signal,
+      noPersist: false,
+      sourcePreload,
+      destinationPreload: preloadFromBase(destinationBase),
+      destinationServed: batchServedFor(member),
+    });
+    sourcePipe = await execPipeline(sourcePath, prepared.sourceEdit!, cwd, {
+      accessMode: constants.R_OK | constants.W_OK,
+      signal,
+      preloadedNorm: prepared.sourcePreload,
+      preserveDeletionSeparators: false,
+    });
+  } catch (error) {
+    noteBatchFailure(member, error);
+    throw error;
+  }
+  const resWarnings: string[] = [];
+  let hedit: HEdit;
+  try {
+    hedit = resEdit(prepared.destinationEdit, resWarnings);
+  } catch (error) {
+    noteBatchFailure(member, error);
+    throw error;
+  }
+  const sourceWarnings = [
+    ...sourcePipe.warnings,
+    ...(sourcePipe.hadUtf8DecodeErrors ? ["Non-UTF-8 bytes were shown as U+FFFD; this edit rewrote the file as UTF-8."] : []),
+  ];
+  return executeBatchMember({
+    member,
+    targetPath: destinationPath,
+    mutationTargetPath,
+    cwd,
+    signal,
+    plan: {
+      hedit,
+      warnings: [...warnings, ...resWarnings, ...sourceWarnings],
+      foldedLines: prepared.destinationFolded,
+      ...(prepared.anchorCarry !== undefined ? { carryIndex: prepared.anchorCarry } : {}),
+      contentSeparators: prepared.endingOverrides,
+      sourceMove: {
+        displayPath: prepared.sourceDisplay,
+        mutationTargetPath: prepared.sourcePreload.absolutePath,
+        pipe: sourcePipe,
+      },
+    },
   });
 }
 
@@ -630,7 +832,7 @@ export async function transferPreview(kind: TransferKind, request: unknown, cwd:
       accessMode: constants.R_OK,
       noPersist: true,
       preloadedNorm: prepared.sourcePreload,
-      allowEmpty: true,
+      preserveDeletionSeparators: false,
       signal,
     });
     const destinationPreview = previewFromPipe(destinationPipe);
@@ -647,7 +849,7 @@ export async function transferPreview(kind: TransferKind, request: unknown, cwd:
   }
 }
 
-function getTransferInput(args: unknown): { path?: string; source_from?: string; source_to?: string; insert_after?: string } | null {
+function getTransferInput(args: unknown): { path?: string; source_from?: string; source_to?: string; anchor?: string; direction?: string } | null {
   let normalized: unknown;
   try {
     normalized = normReq(args);
@@ -658,7 +860,8 @@ function getTransferInput(args: unknown): { path?: string; source_from?: string;
   if (
     typeof normalized.source_from !== "string" ||
     typeof normalized.source_to !== "string" ||
-    typeof normalized.insert_after !== "string"
+    typeof normalized.anchor !== "string" ||
+    typeof normalized.direction !== "string"
   ) {
     return null;
   }
@@ -666,22 +869,27 @@ function getTransferInput(args: unknown): { path?: string; source_from?: string;
     ...(typeof normalized.path === "string" ? { path: normalized.path } : {}),
     source_from: normalized.source_from,
     source_to: normalized.source_to,
-    insert_after: normalized.insert_after,
+    anchor: normalized.anchor,
+    direction: normalized.direction,
   };
 }
 
 const transferSourceFromSchema = Type.String({
   description:
-    "4-char anchor of the FIRST source line to copy (never the row content).",
+    "4-char anchor of the FIRST source line to copy.",
 });
 const transferSourceToSchema = Type.String({
   description:
     "4-char anchor of the LAST source line to copy.",
 });
-const transferInsertAfterSchema = Type.String({
+const transferAnchorSchema = Type.String({
   description:
-    "4-char anchor of the destination line; the block goes after it and may live in another file.",
+    "4-char anchor of the destination line; the block lands before or after it and it may live in another file.",
 });
+const transferDirectionSchema = Type.Union(
+  [Type.Literal("after"), Type.Literal("before")],
+  { description: '"after" places the block below the anchor line, "before" above it' },
+);
 const transferPathRequiredSchema = Type.String({
   description:
     "Path to the source or destination file the anchors were served for; required and must match anchor ownership.",
@@ -691,7 +899,8 @@ const transferToolSchema = Type.Object(
   {
     source_from: transferSourceFromSchema,
     source_to: transferSourceToSchema,
-    insert_after: transferInsertAfterSchema,
+    anchor: transferAnchorSchema,
+    direction: transferDirectionSchema,
   },
   { additionalProperties: true },
 );
@@ -703,7 +912,8 @@ export function buildTransferToolSchema(requirePath: boolean): typeof transferTo
       path: transferPathRequiredSchema,
       source_from: transferSourceFromSchema,
       source_to: transferSourceToSchema,
-      insert_after: transferInsertAfterSchema,
+      anchor: transferAnchorSchema,
+      direction: transferDirectionSchema,
     },
     { additionalProperties: true },
   ) as typeof transferToolSchema;
@@ -714,9 +924,12 @@ type TransferToolDef = ToolDefinition<any, ReplaceDetails, RRState> & { renderSh
 export function buildTransferToolDef(kind: TransferKind, flags: EditToolFlags = DEFAULT_EDIT_FLAGS): TransferToolDef {
   const prompted = withTransferPrompts(
     {
-      description: loadP(`../prompts/${kind}.md`),
-      snippet: loadP(`../prompts/${kind}-snippet.md`),
-      guidelines: loadGuide(`../prompts/${kind}-guidelines.md`),
+      description: loadP(`../tool-prompts/${kind}.md`),
+      snippet: loadP(`../tool-prompts/${kind}-snippet.md`),
+      guidelines: [
+        ...loadGuidelines(`../tool-prompts/${kind}-guidelines.md`),
+        ...loadGuidelines("../tool-prompts/transfer-guidelines.md"),
+      ],
     },
     flags,
   );
@@ -728,6 +941,7 @@ export function buildTransferToolDef(kind: TransferKind, flags: EditToolFlags = 
     promptGuidelines: prompted.guidelines,
     ...editToolBase,
     parameters: buildTransferToolSchema(flags.requirePath),
+    outputSchema: editResultSchema,
     renderCall: makeRenderCall(
       (request, cwd, signal) => transferPreview(kind, request, cwd, signal),
       {
@@ -738,52 +952,84 @@ export function buildTransferToolDef(kind: TransferKind, flags: EditToolFlags = 
     ),
     renderResult: editRenderResultWrapper,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      return withAnchorSession(ctx, async () => {
+      return withStructuredErrors(signal, { diff: "" }, () => withAnchorSession(ctx, async () => {
         const canonical = normReq(params);
         assertTransferReq(canonical);
         const req = canonical;
-        const { refs, warnings } = parseTransferAnchors(req);
-        await throwIfStrictInput(warnings);
-        const { sourcePath, destinationPath } = await resolveTransferTargets(req, ctx.cwd);
-        if (sourcePath !== destinationPath) {
-          return executeCrossFile(kind, refs, warnings, sourcePath, destinationPath, ctx.cwd, signal);
+        const member = batchMemberFor(_toolCallId);
+        let refs: TransferRefs;
+        let warnings: string[];
+        try {
+          ({ refs, warnings } = parseTransferAnchors(req));
+          const sameFileMember = member !== undefined && (member.sourceTarget === undefined || member.sourceTarget === member.target);
+          if (!sameFileMember) await throwIfStrictInput(warnings);
+        } catch (error) {
+          if (member) noteBatchFailure(member, error);
+          throw error;
         }
-        return queuedEdit(sourcePath, ctx.cwd, signal, async (absolutePath, mutationTargetPath) => {
-          const preload = await readNormFile(sourcePath, ctx.cwd, {
-            signal,
-            accessMode: constants.R_OK | constants.W_OK,
-            maxLines: MAX_HASH_LINES,
-          });
-          const displayPath = toDisplayPath(ctx.cwd, preload.absolutePath, sourcePath);
-          let plan: TransferPlan;
-          try {
-            plan = buildTransferEdit({ kind, refs, preload, displayPath, served: servedForPath(preload.absolutePath) });
-          } catch (error) {
-            await noteAnchorError(preload.absolutePath, error);
-            throw error;
+        let sourcePath: string;
+        let destinationPath: string;
+        try {
+          if (member) {
+            await assertTransferPathOption(req, ctx.cwd, member);
+            sourcePath = member.sourceTarget ?? member.target;
+            destinationPath = member.target;
+          } else {
+            ({ sourcePath, destinationPath } = await resolveTransferTargets(req, ctx.cwd));
           }
-          const pipe = await execPipeline(sourcePath, plan.editParams, ctx.cwd, {
-            accessMode: constants.R_OK | constants.W_OK,
-            signal,
-            preloadedNorm: preload,
-            served: plan.servedOverride,
-            endingOverrides: plan.endingOverrides,
+        } catch (error) {
+          if (member) noteBatchFailure(member, error);
+          throw error;
+        }
+        if (sourcePath === destinationPath) {
+          return queuedEdit(sourcePath, ctx.cwd, signal, async (absolutePath, mutationTargetPath) => {
+            if (member) {
+              return executeBatchMember({ member, targetPath: sourcePath, mutationTargetPath, cwd: ctx.cwd, signal });
+            }
+            const preload = await readNormFile(sourcePath, ctx.cwd, {
+              signal,
+              accessMode: constants.R_OK | constants.W_OK,
+              maxLines: MAX_HASH_LINES,
+            });
+            const displayPath = toDisplayPath(ctx.cwd, preload.absolutePath, sourcePath);
+            let plan: TransferPlan;
+            try {
+              plan = buildTransferEdit({ kind, refs, preload, displayPath, served: servedForPath(preload.absolutePath) });
+            } catch (error) {
+              await noteAnchorError(preload.absolutePath, error);
+              throw error;
+            }
+            const pipe = await execPipeline(sourcePath, plan.editParams, ctx.cwd, {
+              accessMode: constants.R_OK | constants.W_OK,
+              signal,
+              preloadedNorm: preload,
+              served: plan.servedOverride,
+              endingOverrides: plan.endingOverrides,
+            });
+            return commitEdit(pipe, {
+              path: pipe.path,
+              absolutePath,
+              mutationTargetPath,
+              editAnchors: [plan.editParams.remove_from, plan.editParams.remove_to],
+              ...(plan.anchorCarry !== undefined ? { anchorCarry: plan.anchorCarry } : {}),
+              ...(plan.endingOverrides !== undefined ? { endingOverrides: plan.endingOverrides } : {}),
+              signal,
+              verb: kind === "copy" ? "copied" : "moved",
+              noopNoun: kind === "copy" ? "Copy" : "Move",
+              foldedAnchorLines: plan.foldedAnchorLines,
+              prefixWarnings: warnings,
+            });
           });
-          return commitEdit(pipe, {
-            path: pipe.path,
-            absolutePath,
-            mutationTargetPath,
-            editAnchors: [plan.editParams.remove_from, plan.editParams.remove_to],
-            ...(plan.anchorCarry !== undefined ? { anchorCarry: plan.anchorCarry } : {}),
-            ...(plan.endingOverrides !== undefined ? { endingOverrides: plan.endingOverrides } : {}),
-            signal,
-            verb: kind === "copy" ? "copied" : "moved",
-            noopNoun: kind === "copy" ? "Copy" : "Move",
-            foldedAnchorLines: plan.foldedAnchorLines,
-            prefixWarnings: warnings,
+        }
+        if (member) {
+          return queuedEdit(destinationPath, ctx.cwd, signal, async (_absolutePath, mutationTargetPath) => {
+            return kind === "copy"
+              ? executeBatchCrossCopy(member, refs, warnings, sourcePath, destinationPath, mutationTargetPath, ctx.cwd, signal)
+              : executeBatchCrossMove(member, refs, warnings, sourcePath, destinationPath, mutationTargetPath, ctx.cwd, signal);
           });
-        });
-      });
+        }
+        return executeCrossFile(kind, refs, warnings, sourcePath, destinationPath, ctx.cwd, signal);
+      }));
     },
   };
 }
