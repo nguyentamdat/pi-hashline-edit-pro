@@ -7,6 +7,7 @@ import {
   resetRegistryForTests,
   allocateAnchor,
   freeAnchors,
+  freeAnchorsForPaths,
   clearRegistry,
   ownerOf,
   ownersForPath,
@@ -30,6 +31,8 @@ import {
 } from "../../src/anchor-registry";
 import { sessionClaimsDir } from "../../src/paths";
 import { lineHashes } from "../../src/hashline";
+import { loadHashStore, upsertSnapshot } from "../../src/hash-store";
+import { contentChecksum } from "../../src/hashline/hasher";
 import { useTestHome } from "../support/fixtures";
 
 useTestHome();
@@ -135,6 +138,60 @@ describe("anchor registry", () => {
     freeAnchors("a.ts");
     expect(ownerOf(b)).toBeUndefined();
     expect(servedForPath("a.ts")).toBeUndefined();
+  });
+
+  it("frees several paths in one pass and keeps unrelated anchors", () => {
+    const a1 = allocateAnchor("a.ts", "ckA1");
+    const a2 = allocateAnchor("a.ts", "ckA2");
+    const b1 = allocateAnchor("b.ts", "ckB1");
+    const keep = allocateAnchor("keep.ts", "ckK");
+    markServed("a.ts", [[a1, "ckA1"], [a2, "ckA2"]]);
+    markServed("b.ts", [[b1, "ckB1"]]);
+
+    expect(() => freeAnchorsForPaths([])).not.toThrow();
+    freeAnchorsForPaths(["a.ts", "b.ts", "never-owned.ts"]);
+
+    expect(ownerOf(a1)).toBeUndefined();
+    expect(ownerOf(a2)).toBeUndefined();
+    expect(ownerOf(b1)).toBeUndefined();
+    expect(ownerOf(keep)).toEqual({ path: "keep.ts", checksum: "ckK" });
+    expect(servedForPath("a.ts")).toBeUndefined();
+    expect(servedForPath("b.ts")).toBeUndefined();
+  });
+
+  it("appends one free event per path freed in a batch", async () => {
+    const sessionFile = join(sessionClaimsDir(), "batch-free.jsonl");
+    await mkdir(sessionClaimsDir(), { recursive: true });
+    await writeFile(sessionFile, "", "utf-8");
+    const ctx = { sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "batch-free" } };
+
+    await withAnchorSession(ctx, () => {
+      allocateAnchor("a.ts", "ckA");
+      allocateAnchor("b.ts", "ckB");
+      freeAnchorsForPaths(["a.ts", "b.ts", "c.ts"]);
+    });
+
+    const log = parseRegistryLog(await readFile(join(sessionClaimsDir(), `${sessionKeyFor(ctx)!}.registry.jsonl`), "utf-8"));
+    expect(log.flatMap((event) => (event.kind === "free" ? [event.path] : []))).toEqual(["a.ts", "b.ts"]);
+  });
+
+  it("frees a large registry against many unrelated paths in one pass", () => {
+    let last = "";
+    for (let i = 0; i < 50_000; i++) last = allocateAnchor("owned.ts", `ck${i}`);
+    const missing = Array.from({ length: 4_000 }, (_, i) => `missing-${i}.ts`);
+
+    const started = Date.now();
+    freeAnchorsForPaths(missing);
+    expect(Date.now() - started).toBeLessThan(2000);
+
+    expect(ownerOf(last)).toEqual({ path: "owned.ts", checksum: "ck49999" });
+    freeAnchorsForPaths(["owned.ts"]);
+    expect(ownersForPath("owned.ts").size).toBe(0);
+  });
+
+  it("is a no-op without an active session", () => {
+    resetRegistryForTests();
+    expect(() => freeAnchorsForPaths(["a.ts"])).not.toThrow();
   });
 
   it("merges and scopes the served record", () => {
@@ -643,5 +700,27 @@ describe("anchor registry", () => {
     adoptAnchors("b.ts", new Map([[anchor, "ckB"]]));
     expect(ownerOf(anchor)).toEqual({ path: "a.ts", checksum: "ckA" });
     expect(servedForPath("b.ts")?.has(anchor) ?? false).toBe(false);
+  });
+
+  it("rejects anchor work once the session's registry was released", async () => {
+    const sessionFile = join(sessionClaimsDir(), "released.jsonl");
+    await mkdir(sessionClaimsDir(), { recursive: true });
+    await writeFile(sessionFile, "", "utf-8");
+    const ctx = { sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "released" } };
+    const pending = withAnchorSession(ctx, () => lineHashes("a\nb\n", join(sessionClaimsDir(), "released.txt")));
+    releaseRegistrySession(sessionKeyFor(ctx)!);
+    await expect(pending).rejects.toThrow(/E_REGISTRY/);
+  });
+
+  it("frees anchors that cannot be matched when a snapshot has no line checksums", async () => {
+    const path = join(sessionClaimsDir(), "no-checksums.txt");
+    const store = await loadHashStore();
+    upsertSnapshot(store, path, contentChecksum("a\nb\nc\n"), 3, ["AAAA", "BBBB", "CCCC"]);
+    adoptAnchors(path, new Map([["AAAA", "ck1"], ["BBBB", "ck2"], ["CCCC", "ck3"]]));
+    const hashes = await lineHashes("a\nX\nc\n", path);
+    expect(hashes).toHaveLength(3);
+    expect(new Set(hashes).size).toBe(3);
+    expect(ownersForPath(path).size).toBe(3);
+    for (const anchor of ["AAAA", "BBBB", "CCCC"]) expect(ownerOf(anchor)).toBeUndefined();
   });
 });

@@ -406,7 +406,7 @@ async function ensureRegistryForKey(key: string, sessionFile: string | undefined
   try {
     await promise;
   } finally {
-    pendingInits.delete(key);
+    if (pendingInits.get(key) === promise) pendingInits.delete(key);
   }
 }
 
@@ -433,6 +433,15 @@ export function sessionKeyFor(ctx: AnchorSessionContext | undefined): string | u
 function sessionFileFor(ctx: AnchorSessionContext | undefined): string | undefined {
   const sessionFile = ctx?.sessionManager?.getSessionFile?.();
   return typeof sessionFile === "string" && sessionFile.length > 0 ? sessionFile : undefined;
+}
+
+export function sessionContextReadable(ctx: AnchorSessionContext | undefined): boolean {
+  try {
+    void ctx?.sessionManager;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function withAnchorSession<T>(ctx: AnchorSessionContext | undefined, fn: () => Promise<T> | T): Promise<T> {
@@ -512,7 +521,7 @@ function hasOwnedPath(state: SessionState, path: string): boolean {
 
 function evictPath(state: SessionState, path: string): string[] {
 	const anchors: string[] = [];
-	for (const [anchor, entry] of [...state.owned]) {
+	for (const [anchor, entry] of state.owned) {
 		if (entry.path === path) {
 			anchors.push(anchor);
 			state.owned.delete(anchor);
@@ -617,6 +626,28 @@ export function freeAnchors(path: string, anchors?: string[]): void {
 	}
 }
 
+export function freeAnchorsForPaths(paths: Iterable<string>): void {
+	const state = current();
+	if (!state) return;
+	const targets = new Set(paths);
+	if (targets.size === 0) return;
+	const freedByPath = new Map<string, string[]>();
+	for (const [anchor, entry] of state.owned) {
+		if (!targets.has(entry.path)) continue;
+		state.owned.delete(anchor);
+		const freed = freedByPath.get(entry.path);
+		if (freed === undefined) freedByPath.set(entry.path, [anchor]);
+		else freed.push(anchor);
+	}
+	for (const path of targets) {
+		state.served.delete(path);
+		state.lastUsedAt.delete(path);
+	}
+	for (const [path, anchors] of freedByPath) {
+		appendEvent({ kind: "free", path, anchors });
+	}
+}
+
 export function clearRegistry(): void {
 	const state = current();
 	if (!state) return;
@@ -690,6 +721,9 @@ export function ownersForPath(path: string): Map<string, string> {
 export function ensureRegistry(): void {
   const key = activeKey();
   if (key && registries.has(key)) return;
+  if (sessionScope.getStore() !== undefined) {
+    throw new Error("[E_REGISTRY] The anchor registry for this session is no longer available; the session was replaced or reloaded. Retry the operation in the new session.");
+  }
   initRegistry(undefined).catch(() => undefined);
 }
 
@@ -951,8 +985,18 @@ export async function allocateFileAnchors(
     if (previousState && snapshotMatchesAllocation(registry, path, previousState.contentChecksum)) {
       prevAnchors = previousState.anchors;
       prevChecksums = previousState.checksums;
-      if (!prevChecksums && previousState.contentChecksum === contentChecksum(content)) {
-        prevChecksums = checksums;
+      if (!prevChecksums) {
+        if (previousState.contentChecksum === contentChecksum(content)) {
+          prevChecksums = checksums;
+        } else if (!shadow) {
+          const state = current();
+          const stale = state && prevAnchors ? prevAnchors.filter((anchor) => state.owned.get(anchor)?.path === path) : [];
+          if (state && stale.length > 0) {
+            const usedAt = state.lastUsedAt.get(path);
+            freeAnchors(path, stale);
+            if (usedAt !== undefined) state.lastUsedAt.set(path, usedAt);
+          }
+        }
       }
     }
   }
