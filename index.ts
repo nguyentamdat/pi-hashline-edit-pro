@@ -29,10 +29,12 @@ import {
   toggleRequirePath,
   toggleStrictInput,
   adjustDiffContextLines,
+  adjustUndoRetentionDays,
+  getUndoRetentionDays,
   setAutoReadAllIgnoreFromText,
   setDisableOnModelsFromText,
 } from "./src/config";
-import { loadHashStore, pruneMissing } from "./src/hash-store";
+import { loadHashStore, pruneExpiredUndo, pruneMissing } from "./src/hash-store";
 import { type AnchorSessionContext, initRegistry, gcRegistrySidecars, clearRegistry, freeAnchors, freeAnchorsForPaths, sessionKeyFor, sessionContextReadable, withAnchorSession, releaseRegistrySession, formatAnchorReclaimNotice, takeReclaimedPaths } from "./src/anchor-registry";
 import { serveRows } from "./src/served";
 import { finalizeTurn, planAssistantMessage } from "./src/batch";
@@ -69,6 +71,7 @@ export default function (pi: ExtensionAPI): void {
   let autoReadAllRequireGit = true;
   let disableOnModels: string[] = [];
   let readOnDisabledModels: ReadOnDisabledModels = "vanilla";
+  let codemodeActive = false;
   let readFlavor: "anchored" | "vanilla" = "anchored";
   let readFlavorCwd: string | undefined;
   let autoReadAllInjected = false;
@@ -81,7 +84,8 @@ export default function (pi: ExtensionAPI): void {
 
   async function refreshEditTools(): Promise<void> {
     try {
-      const flags = await currentEditFlags(pi.getActiveTools().includes("codemode"));
+      codemodeActive = pi.getActiveTools().includes("codemode");
+      const flags = await currentEditFlags(codemodeActive);
       if (readFlavor !== "vanilla") regRead(pi, flags);
       regReplace(pi, flags);
       regReplaceMatch(pi, flags);
@@ -184,6 +188,11 @@ export default function (pi: ExtensionAPI): void {
     loadHashStore()
       .then(async store => {
         freeAnchorsForPaths(await pruneMissing(store));
+        try {
+          pruneExpiredUndo(store, await getUndoRetentionDays());
+        } catch (error) {
+          console.error("Failed to prune expired undo records:", error);
+        }
       })
       .catch(err => {
         console.error("Failed to load hash store:", err);
@@ -252,6 +261,7 @@ export default function (pi: ExtensionAPI): void {
   }));
 
   pi.on("before_agent_start", async (_event, ctx) => withRegistrySession(ctx, async () => {
+    if (pi.getActiveTools().includes("codemode") !== codemodeActive) await refreshEditTools();
     await syncModelGate(ctx.model, ctx.cwd);
     if (autoReadAll === "off" || autoReadAllInjected) return;
     if (modelDisabled(ctx.model, disableOnModels)) return;
@@ -288,6 +298,7 @@ export default function (pi: ExtensionAPI): void {
             else if (key === "disableOnModels") disableOnModels = await setDisableOnModelsFromText(value ?? "");
             else if (key === "readOnDisabledModels") readOnDisabledModels = await cycleReadOnDisabledModels(delta);
             else if (key === "diffContextLines") await adjustDiffContextLines(delta ?? 1);
+            else if (key === "undoRetentionDays") await adjustUndoRetentionDays((delta ?? 1) * 5);
             else if (key === "anchorGrepEnabled") {
               const enabled = await toggleAnchorGrep();
               grepEnabled = enabled;

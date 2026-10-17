@@ -55,6 +55,13 @@ const SHARED_PAYLOAD_OPS = ["replace", "replace_match", "insert"];
 const SHARED_DIFF_OPS = ["replace", "replace_match", "insert", "copy", "move", "undo_last_change"];
 const RESULT_CONTRACT_GUIDELINE =
   'When called from a codemode script, failures resolve to `{ ok: false, kind: "error", error: { code, message } }`; branch on `ok` instead of `try`/`catch`.';
+const READ_SCRIPT_GUIDELINE =
+  '`read`: a codemode script receives `{ text, lines, notices }`; `text` is the raw file content of the served window and `lines[].anchor` is the editable anchor. An image read resolves to an image block.';
+const GREP_SCRIPT_GUIDELINE =
+  '`grep`: a codemode script receives `{ text, results }`; each `results[].lines[]` entry carries the matching line\'s `anchor` and `text`, so a result is editable without a fresh read.';
+function editScriptGuideline(flags: EditToolFlags): string {
+  return `${operationNames(SHARED_EDIT_OPS, flags)}: a codemode script receives \`{ ok, kind: "edit", classification, diff, anchors, anchorsOmitted }\`; reuse \`anchors[].anchor\` to chain the next edit, and read again when \`anchorsOmitted\` is true.`;
+}
 const SCRIPT_BATCH_GUIDELINE =
   "Script calls apply immediately in order, and only the most recent edit per file is undoable.";
 const SCRIPT_TRANSFER_GUIDELINE =
@@ -106,31 +113,20 @@ function strictInputGuideline(flags: EditToolFlags): string {
   return `${tools}: strict-input mode is on; auto-fixable slips are rejected instead of fixed with warnings.`;
 }
 
-function finalizePrompts(
-  description: string,
-  snippet: string,
-  guidelines: string[],
-  flags: EditToolFlags,
-  options?: { stringPayload?: boolean },
-): { description: string; snippet: string; guidelines: string[] } {
-  const shared = [batchGuideline(flags), pathGuideline(flags)];
-  if (flags.codemode) shared.push(RESULT_CONTRACT_GUIDELINE);
-  if (flags.autoRead) shared.push(diffGuideline(flags));
-  if (options?.stringPayload !== false) shared.push(payloadGuideline(flags));
-  if (flags.strictInput) shared.push(strictInputGuideline(flags));
-  return { description, snippet, guidelines: [...guidelines, ...shared] };
-}
-
 export function withReplacePrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
   let description = base.description;
-  const guidelines = [preferenceGuideline(flags), ...base.guidelines.map((guideline) => guideline.text)];
+  const shared = [batchGuideline(flags), pathGuideline(flags)];
+  if (flags.codemode) shared.push(editScriptGuideline(flags));
+  if (flags.autoRead) shared.push(diffGuideline(flags));
+  shared.push(payloadGuideline(flags));
+  if (flags.strictInput) shared.push(strictInputGuideline(flags));
   if (!flags.replaceMatchEnabled) {
     description = description
       .split(/(?<=\.)\s+/)
       .filter((sentence) => !sentence.includes("`replace_match`"))
       .join(" ");
   }
-  return finalizePrompts(description, base.snippet, guidelines, flags);
+  return { description, snippet: base.snippet, guidelines: [...base.guidelines.map((guideline) => guideline.text), ...shared] };
 }
 
 function readGuidelineApplies(guideline: Guideline, flags: EditToolFlags): boolean {
@@ -141,7 +137,7 @@ function readGuidelineApplies(guideline: Guideline, flags: EditToolFlags): boole
 
 export function withReadPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
   const preference = preferenceGuideline(flags);
-  const script = flags.codemode ? [RESULT_CONTRACT_GUIDELINE] : [];
+  const script = flags.codemode ? [READ_SCRIPT_GUIDELINE, RESULT_CONTRACT_GUIDELINE] : [];
   const applicable = base.guidelines.filter((guideline) => readGuidelineApplies(guideline, flags));
   if (flags.autoReadAllActive) {
     const rewritten = applicable.filter((guideline) => guideline.id !== READ_REREAD_ID).map((guideline) => guideline.text);
@@ -153,16 +149,14 @@ export function withReadPrompts(base: { description: string; snippet: string; gu
   return { description: base.description, snippet: base.snippet, guidelines: [preference, ...guidelines, ...script] };
 }
 
-export function withInsertPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
-  const guidelines = [preferenceGuideline(flags), ...base.guidelines.map((guideline) => guideline.text)];
-  return finalizePrompts(base.description, base.snippet, guidelines, flags);
+export function withInsertPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, _flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
+  return { description: base.description, snippet: base.snippet, guidelines: base.guidelines.map((guideline) => guideline.text) };
 }
 
 export function withReplaceMatchPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
-  const guidelines = [preferenceGuideline(flags), ...base.guidelines.map((guideline) => guideline.text)];
-  const prompted = finalizePrompts(base.description, base.snippet, guidelines, flags);
-  if (flags.strictInput) prompted.guidelines.push("`replace_match`: strict-input mode rejects an `old_string` that covers the whole range or retypes unchanged text.");
-  return prompted;
+  const guidelines = base.guidelines.map((guideline) => guideline.text);
+  if (flags.strictInput) guidelines.push("`replace_match`: strict-input mode rejects an `old_string` that covers the whole range or retypes unchanged text.");
+  return { description: base.description, snippet: base.snippet, guidelines };
 }
 
 function gatedEditOps(ops: string[], flags: EditToolFlags): string[] {
@@ -183,8 +177,8 @@ function joinOps(ops: string[], options?: { backtick?: boolean; separator?: "/" 
 }
 
 export function withGrepPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
-  const guidelines = [preferenceGuideline(flags), ...base.guidelines.map((guideline) => guideline.text)];
-  if (flags.codemode) guidelines.push(RESULT_CONTRACT_GUIDELINE);
+  const guidelines = base.guidelines.map((guideline) => guideline.text);
+  if (flags.codemode) guidelines.push(GREP_SCRIPT_GUIDELINE);
   if (flags.copyMoveEnabled) return { description: base.description, snippet: base.snippet, guidelines };
   const description = base.description.replaceAll(GREP_OPS_PHRASE, joinOps(gatedEditOps(["replace", "insert", "copy", "move"], flags)));
   return { description, snippet: base.snippet, guidelines };
@@ -192,10 +186,9 @@ export function withGrepPrompts(base: { description: string; snippet: string; gu
 
 export function withUndoPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
   const ops = gatedEditOps(["replace", "replace_match", "insert", "copy", "move"], flags);
-  const script = flags.codemode ? [RESULT_CONTRACT_GUIDELINE, SCRIPT_UNDO_GUIDELINE] : [];
+  const script = flags.codemode ? [SCRIPT_UNDO_GUIDELINE] : [];
   let description = base.description;
   let guidelines = [
-    preferenceGuideline(flags),
     ...base.guidelines
       .filter((guideline) => flags.copyMoveEnabled || guideline.id !== UNDO_CROSS_FILE_MOVE_ID)
       .map((guideline) => (guideline.id === UNDO_WRITE_CLEARS_ID && !flags.autoRead ? NEUTRAL_UNDO_WRITE_CLEARS : guideline.text)),
@@ -208,9 +201,10 @@ export function withUndoPrompts(base: { description: string; snippet: string; gu
   return { description, snippet: base.snippet, guidelines };
 }
 
-export function withTransferPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags): { description: string; snippet: string; guidelines: string[] } {
-  const guidelines = [preferenceGuideline(flags), ...base.guidelines.map((guideline) => guideline.text), ...(flags.codemode ? [SCRIPT_TRANSFER_GUIDELINE] : [])];
-  return finalizePrompts(base.description, base.snippet, guidelines, flags, { stringPayload: false });
+export function withTransferPrompts(base: { description: string; snippet: string; guidelines: Guideline[] }, flags: EditToolFlags, options?: { scriptGuidelines?: boolean }): { description: string; snippet: string; guidelines: string[] } {
+  const guidelines = base.guidelines.map((guideline) => guideline.text);
+  if (flags.codemode && options?.scriptGuidelines !== false) guidelines.push(SCRIPT_TRANSFER_GUIDELINE);
+  return { description: base.description, snippet: base.snippet, guidelines };
 }
 
 function staleAnchorMessage(ref: string, hash: string, owners: Array<OwnedAnchor | undefined>): string {
