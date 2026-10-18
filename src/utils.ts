@@ -41,6 +41,24 @@ export function splitLines(text: string): string[] {
   return text.endsWith("\n") ? lines.slice(0, -1) : lines;
 }
 
+export function spliceAll<T>(target: T[], start: number, deleteCount: number, items: readonly T[]): T[] {
+  const rawStart = Number.isNaN(start) ? 0 : Math.trunc(start);
+  const at = rawStart < 0 ? Math.max(target.length + rawStart, 0) : Math.min(rawStart, target.length);
+  const rawCount = Number.isNaN(deleteCount) ? 0 : Math.trunc(deleteCount);
+  const remove = Math.max(0, Math.min(rawCount, target.length - at));
+  const removed = target.slice(at, at + remove);
+  const tail = target.slice(at + remove);
+  const additions: readonly T[] = items === target ? [...items] : items;
+  target.length = at;
+  for (const item of additions) target.push(item);
+  for (const item of tail) target.push(item);
+  return removed;
+}
+
+export function anchorCarryIndex(direction: "after" | "before", lineCount: number): number {
+  return direction === "after" ? 0 : lineCount;
+}
+
 export function visLines(text: string): string[] {
   return text.length === 0 ? [] : splitLines(text);
 }
@@ -194,9 +212,11 @@ export function clipLine(line: string, maxLen = 200): string {
 	const flat = line.replace(/\n/g, "\\n");
 	return flat.length > maxLen ? `${flat.slice(0, maxLen)}...` : flat;
 }
-export function assertLineLimit(content: string, displayPath: string, limit: number): void {
-	const count = splitLines(content).length;
+export function assertLineCount(count: number, displayPath: string, limit: number): void {
 	if (count > limit) throw new Error(formatLineLimit(displayPath, limit, count));
+}
+export function assertLineLimit(content: string, displayPath: string, limit: number): void {
+	assertLineCount(splitLines(content).length, displayPath, limit);
 }
 export function assertByteLimit(content: string, displayPath: string, limit = MAX_BYTES): void {
 	if (Buffer.byteLength(content, "utf-8") > limit) {

@@ -23,7 +23,7 @@ import { withAnchorSession, adoptAnchors, ownerOf, ownersDifferingOnlyByCase, fo
 import { serveRows } from "./served";
 import { snapshotCache } from "./hash-store/cache";
 import { Text } from "@earendil-works/pi-tui";
-import { anchoredLine, readResultSchema, withStructuredErrors, type AnchoredLine, type ReadResult } from "./structured";
+import { anchoredLine, readResultSchema, withStructuredErrors, type AnchoredLine, type ReadResult, type ReadTextResult } from "./structured";
 const R_DESC = loadP("../tool-prompts/read.md");
 const R_SNIPPET = loadP("../tool-prompts/read-snippet.md");
 function readGuide(): Guideline[] {
@@ -241,7 +241,6 @@ function anchorRefOf(args: unknown): { anchor: string; limit: number | undefined
 	const { offset, limit, path } = args;
 	if (typeof offset !== "string" || offset.length === 0 || /^\d+$/.test(offset)) return undefined;
 	const validLimit = typeof limit === "number" && Number.isInteger(limit) && limit >= 1 ? limit : undefined;
-	if (limit !== undefined && validLimit === undefined) return undefined;
 	return { anchor: offset, limit: validLimit, path: typeof path === "string" ? path : undefined };
 }
 
@@ -263,26 +262,77 @@ function anchorLineOf(anchor: string, path: string | undefined, cwd: unknown): n
 	return index < 0 ? undefined : index + 1;
 }
 
+const ANSI_ESC = String.fromCharCode(27);
+const CALL_ANSI_RE = new RegExp(`${ANSI_ESC}\\[[0-9;]*m`, "g");
+const CALL_ANSI_AT_RE = new RegExp(`^${ANSI_ESC}\\[[0-9;]*m`);
+
+function rawIndexForPlainIndex(text: string, plainIndex: number): number {
+	let raw = 0;
+	let plain = 0;
+	while (raw < text.length && plain < plainIndex) {
+		const escape = CALL_ANSI_AT_RE.exec(text.slice(raw));
+		if (escape !== null) {
+			raw += escape[0].length;
+			continue;
+		}
+		raw += 1;
+		plain += 1;
+	}
+	return raw;
+}
+
+export function insertBeforeExpandHint(text: string, suffix: string): string {
+	const plain = text.replace(CALL_ANSI_RE, "");
+	if (!plain.endsWith(" to expand)")) return `${text}${suffix}`;
+	const plainIndex = plain.lastIndexOf(" (");
+	const insertAt = plainIndex < 0 ? text.length : rawIndexForPlainIndex(text, plainIndex);
+	return `${text.slice(0, insertAt)}${suffix}${text.slice(insertAt)}`;
+}
+
+function anchorRangeLabel(ref: { anchor: string; limit: number | undefined }, line: number | undefined): string {
+	if (line === undefined) return ref.limit === undefined ? `:${ref.anchor}` : `:${ref.anchor} +${ref.limit}`;
+	return ref.limit === undefined ? `:${line} (${ref.anchor})` : `:${line}-${line + ref.limit - 1} (${ref.anchor})`;
+}
+
 function renderReadCall(args: unknown, theme: any, context: any): Text {
 	const normalized = normalizeReadCallArgs(args);
-	const rendered = builtinReadRenderCall(normalized, theme, context);
 	const ref = anchorRefOf(normalized);
-	if (ref === undefined) return rendered;
-	const marker = `:${ref.anchor}`;
-	const text = (rendered as unknown as { text: string }).text;
-	const index = text.lastIndexOf(marker);
-	if (index < 0) return rendered;
+	if (ref === undefined) return builtinReadRenderCall(normalized, theme, context);
+	const rendered = builtinReadRenderCall(isRec(normalized) ? { ...normalized, offset: undefined, limit: undefined } : normalized, theme, context);
 	const line = anchorLineOf(ref.anchor, ref.path, context?.cwd);
-	if (line === undefined) {
-		if (ref.limit === undefined) return rendered;
-		const suffix = theme.fg("warning", ` +${ref.limit}`);
-		rendered.setText(`${text.slice(0, index + marker.length)}${suffix}${text.slice(index + marker.length)}`);
-		return rendered;
-	}
-	const range = ref.limit === undefined ? `${line}` : `${line}-${line + ref.limit - 1}`;
-	const replacement = theme.fg("warning", `:${range} (${ref.anchor})`);
-	rendered.setText(`${text.slice(0, index)}${replacement}${text.slice(index + marker.length)}`);
+	const suffix = theme.fg("warning", anchorRangeLabel(ref, line));
+	const text = (rendered as unknown as { text: string }).text;
+	rendered.setText(insertBeforeExpandHint(text, suffix));
 	return rendered;
+}
+
+function buildReadToolSchema(codemode: boolean) {
+	return Type.Object({
+		path: Type.String({
+			description: "Path to the file to read (relative or absolute)",
+		}),
+		offset: Type.Optional(
+			Type.Union([
+				Type.Integer({ minimum: 1 }),
+				Type.String(),
+			], { description: "Line number (1-indexed) or a served anchor to start reading from" }),
+		),
+		limit: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				description: "Maximum number of lines to read from offset",
+			}),
+		),
+		...(codemode
+			? {
+					anchors: Type.Optional(
+						Type.Boolean({
+							description: "Return { text, lines, notices } with editable anchors instead of the plain file text to a codemode script",
+						}),
+					),
+				}
+			: {}),
+	});
 }
 
 export function regRead(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FLAGS): void {
@@ -294,23 +344,7 @@ export function regRead(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
     promptSnippet: prompted.snippet,
     promptGuidelines: prompted.guidelines,
 		prepareArguments: makePrepareArguments(),
-		parameters: Type.Object({
-			path: Type.String({
-				description: "Path to the file to read (relative or absolute)",
-			}),
-			offset: Type.Optional(
-				Type.Union([
-					Type.Integer({ minimum: 1 }),
-					Type.String(),
-				], { description: "Line number (1-indexed) or a served anchor to start reading from" }),
-			),
-			limit: Type.Optional(
-				Type.Integer({
-					minimum: 1,
-					description: "Maximum number of lines to read from offset",
-				}),
-			),
-		}),
+		parameters: buildReadToolSchema(flags.codemode),
 		outputSchema: readResultSchema,
 		executionMode: "sequential",
 		renderCall: renderReadCall,
@@ -370,7 +404,7 @@ export function regRead(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
 				const servedRawText = preview.anchoredLines.map((row) => fileLines[row.line - 1] ?? "").join("\n");
 				const rawTruncation = servedRawText.length > 0 ? truncateHead(servedRawText, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES }) : undefined;
 
-				const structuredContent: ReadResult = {
+				const readResult: ReadTextResult = {
 					ok: true,
 					kind: "read",
 					path: rawPath,
@@ -384,6 +418,8 @@ export function regRead(pi: ExtensionAPI, flags: EditToolFlags = DEFAULT_EDIT_FL
 					hadUtf8DecodeErrors,
 					notices,
 				};
+				const anchorsRequested = isRec(params) && params.anchors === true;
+				const structuredContent: ReadResult = flags.codemode && !anchorsRequested ? readResult.text : readResult;
 				return {
 					content: [{ type: "text", text: previewText }],
 					details: {
