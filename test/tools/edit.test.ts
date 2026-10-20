@@ -295,7 +295,7 @@ describe("replace literal escape hints", () => {
       expect(writtenAnchor).toMatch(/^[A-Za-z]{4}$/);
       const within = await getTool("replace_match").execute(
         "e2",
-        { replace_from: writtenAnchor!, replace_to: writtenAnchor!, old_string: String.raw`\u200b`, new_string: "\u200b" },
+        { replace_from: writtenAnchor!, replace_to: writtenAnchor!, match: String.raw`\u200b`, replacement: "\u200b" },
         undefined,
         undefined,
         ctx,
@@ -317,7 +317,7 @@ describe("edit fidelity hints", () => {
         undefined, undefined, ctx,
       );
       expect(result.content[0].text).toContain("[H_UNICODE_LOST]");
-      expect(result.details.hints).toContainEqual(expect.stringContaining("U+200B"));
+      expect(result.details.hints).toContainEqual(expect.stringContaining(String.raw`\u200b`));
       expect(result.details.metrics?.warnings).toBe(0);
       expect(await readFile(path, "utf-8")).toBe("alpha\nstableCheckout\n");
     });
