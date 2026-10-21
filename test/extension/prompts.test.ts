@@ -60,7 +60,7 @@ const replacePrompt = readFileSync(
 
 describe("tool-prompts/replace.md (model-facing contract)", () => {
   it("declares the tool purpose", () => {
-    expect(replacePrompt).toMatch(/Replace a range of lines \(or a single line\) in a text file.*anchors/);
+    expect(replacePrompt).toMatch(/Replace a range of lines \(or a single line\) in a text file by anchor/);
   });
 });
 
@@ -301,6 +301,7 @@ describe("edit prompt flag variants", () => {
     expect(shared).toContain("`replace`/`replace_match`/`insert`/`copy`/`move`: anchors resolve the file; `path` is optional");
     expect(shared).toContain("`replace`/`replace_match`/`insert`: `text` is written exactly as received; escapes are decoded once when the call is parsed, and the tool never decodes again");
     expect(shared).toContain("`replace`/`replace_match`/`insert`/`copy`/`move`/`undo_last_change`: in the post-edit diff, `-anchor│` rows are dead anchors");
+    expect(shared).toContain("Rows the diff does not show keep their anchors, so a follow-up edit on them needs no re-read");
     const transfer = withTransferPrompts({
       description: loadP("../tool-prompts/copy.md"),
       snippet: loadP("../tool-prompts/copy-snippet.md"),
@@ -322,13 +323,12 @@ describe("edit prompt flag variants", () => {
     expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("use `replace` with the same anchor"))).toBe(true);
   });
 
-  it("withGrepPrompts drops copy and move when Copy/move is off", () => {
+  it("withGrepPrompts keeps the grep description verbatim for every flag combination", () => {
     const on = withGrepPrompts(grepBase, DEFAULT_EDIT_FLAGS);
-    expect(on.description).toContain("replace, insert, copy, or move");
+    expect(on.description).toBe(grepBase.description);
+    expect(on.description).toContain("editable with replace, insert, copy, or move without a new read");
     const off = withGrepPrompts(grepBase, { ...DEFAULT_EDIT_FLAGS, copyMoveEnabled: false });
-    expect(off.description).not.toContain("copy");
-    expect(off.description).not.toContain("or move");
-    expect(off.description).toContain("replace or insert");
+    expect(off.description).toBe(grepBase.description);
   });
 
   it("withGrepPrompts keeps the literal-matching and row-marker guidelines", () => {
@@ -397,7 +397,10 @@ describe("edit prompt flag variants", () => {
   it("keeps the end-append transfer guideline", () => {
     const guidelines = loadGuidelines("../tool-prompts/transfer-guidelines.md");
     expect(guidelines.some((g) => g.text.includes("to append to the end of a file, anchor that file's last line"))).toBe(true);
-    expect(guidelines.some((g) => g.text.includes("not a marker line and not the block's own end"))).toBe(true);
+  });
+
+  it("states that a same-file move may re-anchor the source-to-destination span", () => {
+    expect(loadP("../tool-prompts/move.md")).toContain("may be re-anchored");
   });
 
   it("keeps the require-path and strict notices off the transfer tools", () => {
