@@ -94,9 +94,9 @@ export function parseTransferAnchors(req: TransferReq): { refs: TransferRefs; wa
   const destination = stripAnchorRow(req.anchor.trim(), "anchor entry", warnings);
   return {
     refs: {
-      sourceFrom: parseHashRef(from),
-      sourceTo: parseHashRef(to),
-      anchor: parseHashRef(destination),
+      sourceFrom: parseHashRef(from, warnings, "source_from"),
+      sourceTo: parseHashRef(to, warnings, "source_to"),
+      anchor: parseHashRef(destination, warnings, "anchor"),
       direction: req.direction,
     },
     warnings,
@@ -890,20 +890,21 @@ function getTransferInput(args: unknown): { path?: string; source_from?: string;
 
 const transferSourceFromSchema = Type.String({
   description:
-    "4-char anchor of the FIRST source line to copy.",
+    "5-char anchor of the FIRST source line.",
 });
 const transferSourceToSchema = Type.String({
   description:
-    "4-char anchor of the LAST source line to copy.",
+    "5-char anchor of the LAST source line.",
 });
 const transferAnchorSchema = Type.String({
   description:
-    "4-char anchor of the destination line; the block lands before or after it and it may live in another file.",
+    "5-char anchor of the destination line; the block lands before or after it and it may live in another file.",
 });
-const transferDirectionSchema = Type.Union(
-  [Type.Literal("after"), Type.Literal("before")],
-  { description: '"after" places the block below the anchor line, "before" above it' },
-);
+const transferDirectionSchema = Type.Unsafe<"after" | "before">({
+  type: "string",
+  enum: ["after", "before"],
+  description: '"after" places the block below the anchor line, "before" above it',
+});
 const transferPathRequiredSchema = Type.String({
   description:
     "Path to the source or destination file the anchors were served for; required and must match anchor ownership.",

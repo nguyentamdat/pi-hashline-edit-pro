@@ -72,11 +72,11 @@ const readPrompt = readFileSync(
 describe("tool-prompts/read.md (model-facing contract)", () => {
   it("declares the HASH|content output format", () => {
     expect(readPrompt).toMatch(/anchor│content/);
-    expect(readPrompt).toMatch(/4-character/);
+    expect(readPrompt).toMatch(/5-character/);
   });
 
-  it("specifies the letters-only anchor alphabet", () => {
-    expect(readPrompt).toMatch(/4-character/);
+  it("specifies the lowercase letters-only anchor alphabet", () => {
+    expect(readPrompt).toMatch(/5-character/);
     expect(readPrompt).toContain("letters only");
   });
 
@@ -317,9 +317,10 @@ describe("edit prompt flag variants", () => {
     expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("only the fragment that changes"))).toBe(true);
   });
 
-  it("keeps the replace_match range and single-line guidelines", () => {
+  it("keeps the replace_match range and line-break guidelines", () => {
     expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("the anchors bound the range searched"))).toBe(true);
-    expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("must each stay within one line"))).toBe(true);
+    expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("`match` must stay within one line"))).toBe(true);
+    expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("`replacement` may span lines"))).toBe(true);
     expect(loadGuide("../tool-prompts/replace-match-guidelines.md").some((g) => g.includes("use `replace` with the same anchor"))).toBe(true);
   });
 
@@ -331,10 +332,11 @@ describe("edit prompt flag variants", () => {
     expect(off.description).toBe(grepBase.description);
   });
 
-  it("withGrepPrompts keeps the literal-matching and row-marker guidelines", () => {
+  it("withGrepPrompts keeps the literal-matching guideline and leaves row markers to the description", () => {
     const result = withGrepPrompts(grepBase, DEFAULT_EDIT_FLAGS);
     expect(result.guidelines.some((guideline) => guideline.includes("set `literal: true`"))).toBe(true);
-    expect(result.guidelines.some((guideline) => guideline.includes("`N:│` rows are matches"))).toBe(true);
+    expect(result.guidelines.some((guideline) => guideline.includes("`N:│`"))).toBe(false);
+    expect(result.description).toContain("`lineNumber:│ anchor│content`");
   });
 
   it("withReadPrompts lists only the enabled edit tools in its first guideline", () => {

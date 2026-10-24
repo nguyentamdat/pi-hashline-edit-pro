@@ -20,13 +20,14 @@ export { assertInsertReq, type InsertReq };
 
 const insertAnchorSchema = Type.String({
   description:
-    "4-char anchor of the line to insert next to.",
+    "5-char anchor of the line to insert next to.",
 });
 
-const insertDirectionSchema = Type.Union(
-  [Type.Literal("after"), Type.Literal("before")],
-  { description: '"after" or "before"' },
-);
+const insertDirectionSchema = Type.Unsafe<"after" | "before">({
+  type: "string",
+  enum: ["after", "before"],
+  description: '"after" or "before"',
+});
 const insertTextSchema = Type.String({
   description:
     `The exact text to insert; an empty string inserts one blank line. ${TEXT_ENDING_NOTE} Never include the anchor line.`,
@@ -58,7 +59,7 @@ export function parseInsertAnchor(raw: string): { ref: Anchor; warnings: string[
   const trimmedAnchor = raw.trim();
   const warnings: string[] = [];
   const anchorText = stripAnchorRow(trimmedAnchor, "anchor entry", warnings);
-  return { ref: parseHashRef(anchorText), warnings };
+  return { ref: parseHashRef(anchorText, warnings, "anchor"), warnings };
 }
 
 export function buildInsertEdit(

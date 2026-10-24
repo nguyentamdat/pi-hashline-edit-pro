@@ -31,7 +31,7 @@ describe("strict hashline tool loop", () => {
         undefined,
         undefined,
         ctx,
-      ))).toMatch(/E_STALE_ANCHOR.*not owned in this session/);
+      ))).toMatch(/E_STALE_ANCHOR.*is stale: it was valid earlier in this session/);
 
       const secondRead = await readTool.execute("r2", { path: "sample.ts" }, undefined, undefined, ctx);
       const secondText = secondRead.content[0].text as string;
@@ -58,7 +58,7 @@ describe("strict hashline tool loop", () => {
 
       const readResult = await readTool.execute("r1", { path: "empty.ts" }, undefined, undefined, ctx);
       const emptyHash = readResult.content[0].text.split("\n")[0]!.split("│")[0]!;
-      expect(emptyHash).toMatch(/^[A-Za-z]{4}$/);
+      expect(emptyHash).toMatch(/^[a-z]{5}$/);
 
       await editTool.execute(
         "e1",

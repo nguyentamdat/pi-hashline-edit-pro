@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Compile } from "typebox/compile";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import register from "../../index";
@@ -54,6 +55,23 @@ describe("copy and move registration", () => {
     expect(schema.properties?.anchor).toBeDefined();
     expect(schema.properties?.direction).toBeDefined();
     expect(schema.additionalProperties).toBe(true);
+  });
+
+  it("declares direction as a flat string enum", () => {
+    const { pi, getTool } = makeFakePiRegistry();
+    register(pi);
+    for (const name of ["copy", "move"]) {
+      const schema = getTool(name).parameters as { properties: Record<string, unknown> };
+      expect(schema.properties.direction).toEqual({
+        type: "string",
+        enum: ["after", "before"],
+        description: '"after" places the block below the anchor line, "before" above it',
+      });
+      const validator = Compile(schema.properties.direction as never);
+      expect(validator.Check("after")).toBe(true);
+      expect(validator.Check("before")).toBe(true);
+      expect(validator.Check("below")).toBe(false);
+    }
   });
 
   it("adds path to the schema when require-path mode is on", () => {
@@ -286,8 +304,8 @@ describe("copy and move validation", () => {
   it("requires source_from, source_to, anchor, and direction", async () => {
     await withTempFile("sample.txt", "alpha\nbeta\n", async ({ cwd }) => {
       const { ctx, getTool } = setupIntegrationTest(cwd);
-      expect(await toolError(() => getTool("copy").execute("c1", { source_from: "Hasu" }, undefined, undefined, ctx))).toContain("[E_BAD_SHAPE]");
-      expect(await toolError(() => getTool("move").execute("m1", { source_from: "Hasu", source_to: "Hasu", direction: "after", anchor: "Hasu", extra: true }, undefined, undefined, ctx))).toMatch(/unknown or unsupported fields/);
+      expect(await toolError(() => getTool("copy").execute("c1", { source_from: "hasux" }, undefined, undefined, ctx))).toContain("[E_BAD_SHAPE]");
+      expect(await toolError(() => getTool("move").execute("m1", { source_from: "hasux", source_to: "hasux", direction: "after", anchor: "hasux", extra: true }, undefined, undefined, ctx))).toMatch(/unknown or unsupported fields/);
     });
   });
 
@@ -381,14 +399,14 @@ describe("copy and move validation", () => {
       const bText = getText(await readTool.execute("r2", { path: "b.ts" }, undefined, undefined, ctx));
       const alpha = anchorFor(aText, "alpha");
       const one = anchorFor(bText, "one");
-      expect(await toolError(() => getTool("copy").execute("c1", { source_from: alpha, source_to: "PyBY", direction: "after", anchor: one }, undefined, undefined, ctx))).toContain("[E_STALE_ANCHOR]");
+      expect(await toolError(() => getTool("copy").execute("c1", { source_from: alpha, source_to: "pybyx", direction: "after", anchor: one }, undefined, undefined, ctx))).toContain("[E_STALE_ANCHOR]");
     });
   });
 
   it("rejects a stale anchor", async () => {
     await withTempFile("sample.txt", "alpha\nbeta\n", async ({ cwd }) => {
       const { ctx, getTool } = setupIntegrationTest(cwd);
-      expect(await toolError(() => getTool("move").execute("m1", { source_from: "PyBY", source_to: "PyBY", direction: "after", anchor: "PyBY" }, undefined, undefined, ctx))).toContain("[E_STALE_ANCHOR]");
+      expect(await toolError(() => getTool("move").execute("m1", { source_from: "pybyx", source_to: "pybyx", direction: "after", anchor: "pybyx" }, undefined, undefined, ctx))).toContain("[E_STALE_ANCHOR]");
     });
   });
 
@@ -568,8 +586,8 @@ describe("copy and move previews", () => {
       const preview = await transferPreview("copy", { source_from: beta, source_to: beta, direction: "before", anchor: gamma }, cwd);
       const diff = (preview as { diff: string }).diff;
       expect(diff).toContain(` ${gamma}│gamma`);
-      expect(diff).not.toMatch(/^-[A-Za-z]{4}│gamma$/m);
-      expect(diff).not.toMatch(/^\+[A-Za-z]{4}│gamma$/m);
+      expect(diff).not.toMatch(/^-[a-z]{5}│gamma$/m);
+      expect(diff).not.toMatch(/^\+[a-z]{5}│gamma$/m);
     });
   });
 
@@ -595,7 +613,7 @@ describe("copy and move previews", () => {
       const theme = fakeTheme();
       expect(tool.renderCall("nope", theme, renderContext(cwd))).toBeDefined();
       expect(tool.renderCall({ source_from: 42 }, theme, renderContext(cwd))).toBeDefined();
-      expect(tool.renderCall({ source_from: "Hasu", source_to: "Hasu", direction: "after", anchor: "Hasu" }, theme, renderContext(cwd))).toBeDefined();
+      expect(tool.renderCall({ source_from: "hasux", source_to: "hasux", direction: "after", anchor: "hasux" }, theme, renderContext(cwd))).toBeDefined();
     });
   });
 });
@@ -605,7 +623,7 @@ describe("auto-read after copy and move", () => {
     const { pi, handlers } = makePiStub();
     register(pi);
     const handler = handlers.get("tool_result")!;
-    const diff = " alpha\n+Qwer│beta";
+    const diff = " alpha\n+qwerx│beta";
     const result = (await handler(
       {
         toolName: "copy",
@@ -686,8 +704,8 @@ describe("cross-file previews and require-path", () => {
       const preview = await transferPreview("copy", { source_from: beta, source_to: beta, direction: "before", anchor: one }, dir);
       const diff = (preview as { diff: string }).diff;
       expect(diff).toContain(` ${one}│one`);
-      expect(diff).not.toMatch(/^-[A-Za-z]{4}│one$/m);
-      expect(diff).not.toMatch(/^\+[A-Za-z]{4}│one$/m);
+      expect(diff).not.toMatch(/^-[a-z]{5}│one$/m);
+      expect(diff).not.toMatch(/^\+[a-z]{5}│one$/m);
     });
   });
 
@@ -705,8 +723,8 @@ describe("cross-file previews and require-path", () => {
       expect(diff).toContain("--- a.ts ---");
       expect(diff).toContain("--- b.ts ---");
       expect(diff).toContain(` ${one}│one`);
-      expect(diff).not.toMatch(/^-[A-Za-z]{4}│one$/m);
-      expect(diff).not.toMatch(/^\+[A-Za-z]{4}│one$/m);
+      expect(diff).not.toMatch(/^-[a-z]{5}│one$/m);
+      expect(diff).not.toMatch(/^\+[a-z]{5}│one$/m);
     });
   });
 
@@ -966,8 +984,8 @@ describe("copy and move direction", () => {
   });
 
   it("rejects a missing or invalid direction at the request contract", () => {
-    expect(() => assertTransferReq({ source_from: "Hasu", source_to: "Hasu", anchor: "Qwer" })).toThrow(/"direction"/);
-    expect(() => assertTransferReq({ source_from: "Hasu", source_to: "Hasu", anchor: "Qwer", direction: "sideways" })).toThrow(/"direction"/);
-    expect(() => assertTransferReq({ source_from: "Hasu", source_to: "Hasu", insert_after: "Qwer" })).toThrow(/unknown or unsupported fields/);
+    expect(() => assertTransferReq({ source_from: "hasux", source_to: "hasux", anchor: "qwerx" })).toThrow(/"direction"/);
+    expect(() => assertTransferReq({ source_from: "hasux", source_to: "hasux", anchor: "qwerx", direction: "sideways" })).toThrow(/"direction"/);
+    expect(() => assertTransferReq({ source_from: "hasux", source_to: "hasux", insert_after: "qwerx" })).toThrow(/unknown or unsupported fields/);
   });
 });

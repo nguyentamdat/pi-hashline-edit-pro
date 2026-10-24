@@ -130,17 +130,17 @@ const ITEM_KS = new Set(["text", "remove_from", "remove_to"]);
 function assertBounds(edit: Record<string, unknown>): void {
 	if ("remove_from" in edit && typeof edit.remove_from !== "string") {
 		throw new Error(
-			`[E_BAD_SHAPE] Field "remove_from" must be an anchor string (4-char anchor).`,
+			`[E_BAD_SHAPE] Field "remove_from" must be an anchor string (5-char anchor).`,
 		);
 	}
 	if ("remove_to" in edit && typeof edit.remove_to !== "string") {
 		throw new Error(
-			`[E_BAD_SHAPE] Field "remove_to" must be an anchor string (4-char anchor).`,
+			`[E_BAD_SHAPE] Field "remove_to" must be an anchor string (5-char anchor).`,
 		);
 	}
 	if (typeof edit.remove_from !== "string" || typeof edit.remove_to !== "string") {
 		throw new Error(
-			`[E_BAD_SHAPE] The edit requires "remove_from" and "remove_to" anchor strings (4-char anchors from read output).`,
+			`[E_BAD_SHAPE] The edit requires "remove_from" and "remove_to" anchor strings (5-char anchors from read output).`,
 		);
 	}
 }
@@ -175,18 +175,32 @@ function resolveParsedEdit(removeFrom: string, removeTo: string, parsed: ParsedT
 	}) as [string, string];
 	return {
 		content_lines: replaceLines,
-		hash_bounds: [parseHashRef(bounds[0]), parseHashRef(bounds[1])],
+		hash_bounds: [parseHashRef(bounds[0], warnings, "remove_from"), parseHashRef(bounds[1], warnings, "remove_to")],
 		...(parsed.separators.some((separator) => separator !== undefined) ? { content_separators: parsed.separators } : {}),
 	};
 }
 
 export const ANCHOR_ROW_RE = new RegExp(`^([+-]?)(${HASH_RUN})│`);
 
+const NUMBERED_ANCHOR_ROW_RE = new RegExp(`^\\s*\\d+\\s*[:-]?\\s*│\\s*(${HASH_RUN})│`);
+
+const PAREN_LINE_SUFFIX_RE = new RegExp(`^(${HASH_RUN})\\s*\\(\\s*(?:line|lines)\\s+\\d+(?:\\s*[-–—]\\s*\\d+)?\\s*\\)$`, "i");
+
 export function stripAnchorRow(
 	trimmed: string,
 	entryLabel: string,
 	warnings?: string[],
 ): string {
+	const numbered = trimmed.match(NUMBERED_ANCHOR_ROW_RE);
+	if (numbered) {
+		warnings?.push(`[W_BAD_REF] Stripped line-numbered row from ${entryLabel} "${clipLine(trimmed, 48)}".`);
+		return numbered[1]!;
+	}
+	const paren = trimmed.match(PAREN_LINE_SUFFIX_RE);
+	if (paren) {
+		warnings?.push(`[W_BAD_REF] Stripped "(line N)" suffix from ${entryLabel} "${clipLine(trimmed, 48)}".`);
+		return paren[1]!;
+	}
 	const match = trimmed.match(ANCHOR_ROW_RE);
 	if (!match) return trimmed;
 	const marker =
@@ -435,17 +449,17 @@ export function assertRangeServed(
     rows.push(fmtRow(hash, clipLine(content)));
   }
   const location = filePath ? ` in ${filePath}` : "";
+  const rangeDescription = `the replaced range (lines ${startLine}-${endLine})${location}`;
   const first = mismatchLines[0]!;
-  const mismatchText =
-    mismatchLines.length === 1
-      ? `Line ${first} of the replaced range (lines ${startLine}-${endLine})${location} does not match`
-      : `${mismatchLines.length} of ${rangeLength} line(s) in the replaced range (lines ${startLine}-${endLine})${location} do not match`;
+  const mismatchText = mismatchLines.length === 1
+    ? `Line ${first} of ${rangeDescription} was never shown or changed on disk`
+    : `${mismatchLines.length} of ${rangeLength} line(s) in ${rangeDescription} were never shown or changed on disk`;
   const capHint =
     rangeLength > shownLength
       ? `\n\n[The range has ${rangeLength} lines; showing the first ${shownLength}. Call read()${filePath ? ` on ${filePath}` : ""} with offset=${startLine + shownLength} to see the rest.]`
       : "\n\nRetry with the fresh anchors above without a read.";
   const message =
-    `[E_RANGE_STALE] ${mismatchText} what was shown. Current range with fresh anchors:\n\n${rows.join("\n")}${capHint}`;
+    `[E_RANGE_STALE] ${mismatchText}. Current range with fresh anchors:\n\n${rows.join("\n")}${capHint}`;
   throw new RangeStaleError(message, shownHashes, shownMap);
 }
 
